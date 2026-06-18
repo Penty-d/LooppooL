@@ -1,0 +1,36 @@
+# ─── 依赖与构建产物 ───────────────────────────────────────
+node_modules/
+dist/
+*.tsbuildinfo
+
+# ─── 运行时数据 ──────────────────────────────────────────
+logs/
+data/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# AgentEngine 运行时工作目录（每个任务的 sandbox）
+.looppool-workspace/
+.smoke-workspace/
+
+# 解析失败时落盘的原始模型输出（按 requestId 分目录）
+.looppool-logs/
+
+# ─── 密钥与本地配置 ──────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# 模型库配置：含真实 API key，切勿提交。复制 models.example.json 为 models.json 后填入
+src/config/models.json
+
+# ─── 编辑器 / 系统 ───────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~

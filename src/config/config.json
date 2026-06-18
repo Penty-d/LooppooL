@@ -1,0 +1,17 @@
+{
+  "system": {
+    "maxIterations": 5,
+    "taskTimeout": 1800000,
+    "globalParallelLimit": 10,
+    "validationThreshold": 80
+  },
+  "logging": {
+    "level": "info",
+    "outputs": ["console", "file"],
+    "filePath": "./logs/looppool.log"
+  },
+  "storage": {
+    "persistHistory": true,
+    "historyPath": "./data/history"
+  }
+}
