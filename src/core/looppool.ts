@@ -61,10 +61,22 @@ export class LoopPool {
       try {
         // 1. 生成执行计划：第二轮起优先用上轮决策给的 newPlan（基于 agent output 写的）
         //    没有时才回退到 generatePlan（重新规划，但上下文比 newPlan 弱）
+        const usedNewPlan = !!pendingPlan;
         const plan = pendingPlan
           ? this.adoptPendingPlan(pendingPlan)
           : await this.orchestrator.generatePlan(context);
         pendingPlan = undefined;
+
+        const taskCount = plan.stages.reduce((s, st) => s + st.tasks.length, 0);
+        console.log(`  [debug] iter ${iteration}: stages=${plan.stages.length} tasks=${taskCount} source=${usedNewPlan ? 'newPlan' : 'generatePlan'}`);
+
+        // 防"无限空迭代"：plan 里一个 task 都没有，直接报错退出
+        if (taskCount === 0) {
+          throw new Error(
+            `调度器生成的计划没有任何任务（stages=${plan.stages.length}），无法执行。` +
+            `可能是调度器输出格式异常，查看 .looppool-logs/${context.requestId}/ 下的 plan-raw-* 文件`
+          );
+        }
 
         // 2. 执行计划
         const results = await this.taskPool.executePlan(plan);

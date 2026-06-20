@@ -8,6 +8,7 @@ import {
   Decision,
 } from '../types';
 import { ModelRegistry } from '../execution/model-registry';
+import { jsonrepair } from 'jsonrepair';
 import {
   logPlanning,
   logPlanReady,
@@ -49,6 +50,11 @@ export class Orchestrator {
       this.buildPlanningPrompt(context)
     );
 
+    // DEBUG：无论解析成功与否，都把原始输出落盘，方便排查"空 plan / 一直迭代"
+    const debugDump = dumpRawLog(context.requestId, `plan-raw-iter${context.history.length + 1}`, text);
+    console.log(`  [debug] 调度器原始输出 ${text.length} 字符 → ${debugDump.relativePath}`);
+    console.log(`  [debug] 头 200 字符: ${text.slice(0, 200).replace(/\s+/g, ' ')}`);
+
     const plan = this.parsePlan(text, context.requestId);
     logPlanReady(plan.stages.length, this.countTasks(plan));
     logReasoning(plan.reasoning);
@@ -68,7 +74,13 @@ export class Orchestrator {
       this.buildAnalysisPrompt(context, plan, results)
     );
 
+    // DEBUG：决策原始输出也落盘
+    const debugDump = dumpRawLog(context.requestId, `decision-raw-iter${context.history.length + 1}`, text);
+    console.log(`  [debug] 决策原始输出 ${text.length} 字符 → ${debugDump.relativePath}`);
+    console.log(`  [debug] 头 300 字符: ${text.slice(0, 300).replace(/\s+/g, ' ')}`);
+
     const decision = this.parseDecision(text, context.requestId);
+    console.log(`  [debug] 决策: shouldContinue=${decision.shouldContinue} score=${decision.qualityScore} hasNewPlan=${!!decision.newPlan} hasFinal=${!!decision.finalResult}`);
     logDecision(decision.shouldContinue, decision.qualityScore, decision.reason);
     return decision;
   }
@@ -111,9 +123,24 @@ export class Orchestrator {
   - execute  ：实际产出代码/文件/答案；侦察任务也属于这类（产出是结构化分析文本）
   - validate ：审查某个 execute 任务的产出，给出评分和问题清单
 
+==========================================
+**workdir（工作目录）—— 每个 task 的文件访问边界**
+==========================================
+agent 的所有文件操作（read_file / write_file / glob / grep / bash cwd）都被限制在 workdir 内，
+无法访问 workdir 之外的任何路径。所以你必须在每个 task 上填对 workdir：
+
+  · **从零创建**（"创建 helloworld"、"写个加法函数"）→ workdir 留空，系统给隔离 sandbox
+  · **侦察/优化/重构现有项目**（"优化我的项目"、"重构 X 模块"）→ workdir 必须填项目根目录的**绝对路径**
+    （从用户需求里提取，如 "D:\\\\Projects\\\\user"；如果需求里没明确路径，第一轮先派 agent 用 bash 探索
+     常见位置如当前目录、~、D:\\\\ 等，把找到的绝对路径写到 output 里，下一轮再据此填 workdir）
+  · **validate 任务** → workdir 留空，系统自动复用被验收任务的 workdir
+
+**关键**：workdir 必须是真实存在的目录。如果你臆造一个不存在的路径，agent 会立刻报错"目录不存在"并停止，
+浪费一轮迭代。不确定路径时先侦察，别猜。
+
 为 execute 任务写 prompt 时必须包含（缺一不可）：
   · **目标**：一句话说清要产出什么
-  · **产物位置**：明确文件应该放哪个路径（绝对路径或 workspace 相对路径）
+  · **产物位置**：相对 workdir 的路径（如 "src/add.ts"），不要写绝对路径——绝对路径由 workdir 决定
   · **完成判定**：怎样才算完成（"能 python 跑通输出 X" / "npm test 全过" / "至少 N 个测试用例"）
   · **质量约束**（按需）：代码风格、安全要求、性能预期
   · 不要在 prompt 里说"接下来你要..."这种引导词，直接陈述要求
@@ -194,7 +221,8 @@ validate 任务的 prompt 必须包含：
           "kind": "execute",
           "model": "清单中某个模型 id",
           "description": "简短描述（用于日志，10 字以内）",
-          "prompt": "完整指令——目标、产物路径、完成判定全写进来"
+          "workdir": "绝对路径（侦察/优化现有项目时必填；从零创建留空）",
+          "prompt": "完整指令——目标、产物相对路径、完成判定全写进来"
         }
       ]
     },
@@ -343,23 +371,49 @@ shouldContinue=false 时给 finalResult（newPlan 省略）。
     return match ? match[0] : text;
   }
 
-  private parsePlan(output: string, requestId: string): ExecutionPlan {
+  /**
+   * 容错 JSON 解析
+   *
+   * LLM 输出 JSON 时常见瑕疵：
+   *   1) Windows 路径反斜杠不转义（D:\Projects\user）
+   *   2) 中文长文本里不转义内嵌双引号
+   *   3) 尾随逗号
+   *
+   * jsonrepair 能处理大部分，但唯独 \uXXX 不完整时会当成坏 Unicode 转义报错。
+   * 所以先单独把"非 4 位 hex 的 \u"转义掉，再交给 jsonrepair。
+   */
+  private safeParse(text: string, requestId: string, kind: 'plan' | 'decision'): any {
+    const extracted = this.extractJson(text);
+    // 1. 标准 parse
     try {
-      const parsed = JSON.parse(this.extractJson(output));
-      return {
-        reasoning: parsed.reasoning,
-        stages: this.normalizeStages(parsed.stages),
-        estimatedTime: parsed.estimatedTime,
-        createdAt: new Date(),
-      };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      const dump = dumpRawLog(requestId, 'plan-parse-fail', output);
-      // 错误信息只保留摘要 + 文件路径，避免几千行 JSON 把终端冲爆
+      return JSON.parse(extracted);
+    } catch {
+      // pass
+    }
+    // 2. 修掉 \u 后非 4 位 hex 的情况
+    //    模型在 Windows 路径里写 D:\Projects\user，\u 被当成坏 Unicode 转义
+    //    jsonrepair 唯一处理不了的就是这个。直接把 \u 换成 /u（路径仍有效）
+    const fixedUnicode = extracted.replace(/\\u(?![0-9a-fA-F]{4})/g, '/u');
+    // 3. jsonrepair 兜底（未转义引号、反斜杠、尾随逗号等）
+    try {
+      return JSON.parse(jsonrepair(fixedUnicode));
+    } catch (repairErr) {
+      const msg = repairErr instanceof Error ? repairErr.message : String(repairErr);
+      const dump = dumpRawLog(requestId, `${kind}-parse-fail`, text);
       throw new Error(
-        `计划解析失败: ${msg}\n摘要: ${summarize(output, 160)}\n完整原文: ${dump.relativePath}`
+        `${kind === 'plan' ? '计划' : '决策'}解析失败: ${msg}\n摘要: ${summarize(text, 160)}\n完整原文: ${dump.relativePath}`
       );
     }
+  }
+
+  private parsePlan(output: string, requestId: string): ExecutionPlan {
+    const parsed = this.safeParse(output, requestId, 'plan');
+    return {
+      reasoning: parsed.reasoning,
+      stages: this.normalizeStages(parsed.stages),
+      estimatedTime: parsed.estimatedTime,
+      createdAt: new Date(),
+    };
   }
 
   /**
@@ -380,22 +434,14 @@ shouldContinue=false 时给 finalResult（newPlan 省略）。
   }
 
   private parseDecision(output: string, requestId: string): Decision {
-    try {
-      const parsed = JSON.parse(this.extractJson(output));
-      return {
-        shouldContinue: parsed.shouldContinue,
-        reason: parsed.reason,
-        qualityScore: parsed.qualityScore,
-        newPlan: parsed.newPlan,
-        finalResult: parsed.finalResult,
-      };
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      const dump = dumpRawLog(requestId, 'decision-parse-fail', output);
-      throw new Error(
-        `决策解析失败: ${msg}\n摘要: ${summarize(output, 160)}\n完整原文: ${dump.relativePath}`
-      );
-    }
+    const parsed = this.safeParse(output, requestId, 'decision');
+    return {
+      shouldContinue: parsed.shouldContinue,
+      reason: parsed.reason,
+      qualityScore: parsed.qualityScore,
+      newPlan: parsed.newPlan,
+      finalResult: parsed.finalResult,
+    };
   }
 
   // ---------------- helpers ----------------

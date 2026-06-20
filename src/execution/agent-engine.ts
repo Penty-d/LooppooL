@@ -5,7 +5,7 @@ import { resolve as pathResolve } from 'path';
 import { Task, ExecutionResult } from '../types';
 import { ResolvedModel } from './model-registry';
 import { createTools } from './tools';
-import { logToolCall, logToolResult, logAgentText } from '../ui';
+import { logToolCall, logToolResult, logAgentText, logContextCompaction } from '../ui';
 
 /**
  * Agent 执行引擎（基于 Vercel AI SDK）
@@ -45,16 +45,20 @@ export class AgentEngine {
 
   async run(task: Task, model: ResolvedModel): Promise<ExecutionResult> {
     const startTime = new Date();
-    // validate 任务复用被验收任务的 workspace —— 这样 read_file/glob/grep
-    // 才能直接看到产物文件，而不需要绕道 bash + Get-Content
-    const taskWorkspace = pathResolve(
-      this.workspace,
-      task.input?.workspaceSubdir ??
-        (task.kind === 'validate' && task.input?.targetTaskId
-          ? task.input.targetTaskId
-          : task.id)
-    );
-    mkdirSync(taskWorkspace, { recursive: true });
+    // 工作目录决策（优先级从高到低）：
+    //   1. task.workdir —— 调度器显式指定（侦察/优化现有项目时必填）
+    //   2. validate 任务复用被验收任务的 workdir（在 task-executor.prepareTask 里已处理）
+    //   3. 默认隔离 workspace（从零创建的场景，sandbox）
+    const taskWorkspace = task.workdir
+      ? pathResolve(task.workdir)
+      : pathResolve(this.workspace, task.id);
+    // 注意：调度器指定的 workdir 可能不存在（路径错误或项目未创建），
+    // 这里不自动创建——让 agent 的工具调用报错暴露问题给调度器，
+    // 而不是悄悄建一个空目录让 agent 以为项目在那里。
+    // 默认隔离 workspace 才创建（agent 要在里面写文件）。
+    if (!task.workdir) {
+      mkdirSync(taskWorkspace, { recursive: true });
+    }
 
     try {
       const provider = this.buildProvider(model);
@@ -148,17 +152,24 @@ export class AgentEngine {
    * 共同基底：工具使用纪律、输出格式、错误处理、不允许假装。
    */
   private systemPrompt(workspace: string, task: Task): string {
+    const isWin = process.platform === 'win32';
+    const envInfo = isWin
+      ? `运行环境：Windows + PowerShell。bash 工具实际调用 PowerShell——命令必须用 PowerShell 语法（Get-Content 而非 cat、Get-ChildItem 而非 ls -la、Select-String 而非 grep、$env:VAR 而非 $VAR）。路径分隔符 \\ 和 / 都可。`
+      : `运行环境：Linux/macOS + bash。bash 工具调用 /bin/sh——使用标准 Unix 命令（ls -la / cat / grep / find）。`;
+
     const base = `你是一名运行在受控 sandbox 中的 coding agent。
 
 工作目录（绝对路径）：${workspace}
+${envInfo}
+
 所有文件操作和命令执行都必须使用工具完成，绝对不要在文本里假装写文件、假装运行命令。
-工具：bash（执行 shell）、read_file（读取文件）、write_file（覆盖写入文件）、glob（按模式找文件）、grep（按正则搜内容）。
+工具：bash（执行 shell，语法见上）、read_file（读取文件）、write_file（覆盖写入文件）、glob（按模式找文件）、grep（按正则搜内容）。
 
 通用纪律：
 1. **先调查再动手**：改文件前先 read_file / glob / grep 看清现状，禁止凭空编造路径和代码结构。
 2. **写文件 = 覆盖整个文件**：write_file 会替换整个内容，部分修改也必须先 read_file 拼好完整内容再写。
 3. **批量并行调用**：多个独立的读取 / 搜索可以一次发起多个 tool call，不要串行排队。
-4. **遇错三步**：① 看 stderr 找原因；② 提一个最具体的修复假设；③ 用一条最小命令验证假设。同一个错误最多重试 2 次，再失败就停下说明。
+4. **遇错三步**：① 看 stderr 找原因；② 提一个最具体的修复假设；③ 用一条最小命令验证假设。同一个错误最多重试 2 次，再失败就停下说明。命令报"找不到 cmdlet"通常是 shell 语法用错了——切换到当前 shell 的等价命令。
 5. **不要假装成功**：完不成就直说"无法完成 + 原因 + 已经尝试过什么"。
 6. **简洁、就事论事**：不寒暄、不为自己辩护、不重复贴大段代码、不解释你"接下来要做什么"——直接做。`;
 
@@ -284,10 +295,7 @@ export class AgentEngine {
         0
       );
       if (newTotal <= this.maxInputTokens) {
-        const saved = total - newTotal;
-        console.log(
-          `    [${taskId}] ⚠ context: ${total}→${newTotal} tokens (kept last ${keepRecent} steps, freed ~${saved} tokens)`
-        );
+        logContextCompaction(taskId, total, newTotal, keepRecent);
         return compacted;
       }
     }
@@ -298,9 +306,7 @@ export class AgentEngine {
       (sum, m) => sum + this.estimateMessageTokens(m),
       0
     );
-    console.log(
-      `    [${taskId}] ⚠ context still over budget after compact: ${total}→${newTotal} tokens`
-    );
+    logContextCompaction(taskId, total, newTotal, 1);
     return fallback;
   }
 

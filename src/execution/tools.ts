@@ -55,13 +55,22 @@ export function createTools(ctx: ToolContext) {
   const maxOut = ctx.maxOutputBytes ?? DEFAULT_MAX_OUTPUT;
   const bashTimeout = ctx.bashTimeout ?? DEFAULT_BASH_TIMEOUT;
 
+  // 检测当前 shell 环境，让模型知道用什么语法
+  const isWin = process.platform === 'win32';
+  const shellName = isWin ? 'PowerShell' : 'bash/sh';
+  const shellExe = isWin ? 'powershell.exe' : '/bin/sh';
+  const shellHints = isWin
+    ? '当前是 Windows PowerShell。注意：ls 不支持 -la（用 Get-ChildItem 或 dir）；cat 用 Get-Content；grep 用 Select-String；路径用反斜杠或正斜杠均可；管道和变量用 $ 前缀。'
+    : '当前是 Linux/macOS bash。可用标准 Unix 命令：ls -la、cat、grep、find 等。';
+
   return {
     bash: tool({
       description:
-        '在 workspace 目录下执行 shell 命令。Windows 用 powershell，其他平台用 /bin/sh。' +
-        '返回 stdout + stderr。命令超时或非零退出码会作为错误返回，不会抛异常。',
+        `在 workspace 目录下执行 shell 命令。${shellHints} ` +
+        '返回 stdout + stderr。命令超时或非零退出码会作为错误返回，不会抛异常。' +
+        '如果某条命令因 shell 语法不符报错，换用当前 shell 兼容的写法重试，不要坚持错误的语法。',
       inputSchema: z.object({
-        command: z.string().describe('要执行的 shell 命令'),
+        command: z.string().describe('要执行的 shell 命令（必须符合当前 shell 语法）'),
         cwd: z
           .string()
           .optional()
@@ -75,13 +84,12 @@ export function createTools(ctx: ToolContext) {
       }),
       execute: async ({ command, cwd, timeout_ms }) => {
         const targetCwd = cwd ? safePath(ctx, cwd) : ctx.workspace;
-        const isWin = process.platform === 'win32';
         try {
           const { stdout, stderr } = await execAsync(command, {
             cwd: targetCwd,
             timeout: timeout_ms ?? bashTimeout,
             maxBuffer: 10 * 1024 * 1024,
-            shell: isWin ? 'powershell.exe' : '/bin/sh',
+            shell: shellExe,
             windowsHide: true,
           });
           const out = [stdout, stderr ? `STDERR:\n${stderr}` : '']
@@ -104,34 +112,58 @@ export function createTools(ctx: ToolContext) {
 
     read_file: tool({
       description:
-        '读取 workspace 内一个文本文件的内容。支持可选行范围。' +
-        '文件超过限制时会被截断。',
+        '读取 workspace 内的文本文件。支持一次读多个文件（传 path 数组），' +
+        '也支持可选行范围（对单个文件有效；多文件时读全部）。' +
+        '每个文件内容带文件名头，超长截断。',
       inputSchema: z.object({
-        path: z.string().describe('相对 workspace 的文件路径'),
+        path: z
+          .union([z.string(), z.array(z.string())])
+          .describe('相对 workspace 的文件路径，可传单个字符串或数组（一次读多个）'),
         offset: z
           .number()
           .int()
           .nonnegative()
           .optional()
-          .describe('从第几行开始读，1 起；缺省 1'),
+          .describe('从第几行开始读，1 起；缺省 1（仅对单文件有效）'),
         limit: z
           .number()
           .int()
           .positive()
           .optional()
-          .describe('最多读多少行；缺省 2000'),
+          .describe('最多读多少行；缺省 2000（仅对单文件有效）'),
       }),
       execute: async ({ path, offset = 1, limit = 2000 }) => {
-        const abs = safePath(ctx, path);
-        const content = await fsReadFile(abs, 'utf-8');
-        const lines = content.split('\n');
-        const start = Math.max(0, offset - 1);
-        const slice = lines.slice(start, start + limit);
-        const numbered = slice
-          .map((line, i) => `${start + i + 1}: ${line}`)
-          .join('\n');
-        const head = `# ${path} (lines ${start + 1}-${start + slice.length} of ${lines.length})\n`;
-        return truncate(head + numbered, maxOut);
+        const paths = Array.isArray(path) ? path : [path];
+        const parts: string[] = [];
+        for (const p of paths) {
+          try {
+            const abs = safePath(ctx, p);
+            const content = await fsReadFile(abs, 'utf-8');
+            if (paths.length === 1) {
+              // 单文件：支持 offset/limit
+              const lines = content.split('\n');
+              const start = Math.max(0, offset - 1);
+              const slice = lines.slice(start, start + limit);
+              const numbered = slice
+                .map((line, i) => `${start + i + 1}: ${line}`)
+                .join('\n');
+              parts.push(`# ${p} (lines ${start + 1}-${start + slice.length} of ${lines.length})\n${numbered}`);
+            } else {
+              // 多文件：每个只显示带行号的完整内容（不截行，整体受 maxOut 限制）
+              const lines = content.split('\n');
+              const numbered = lines
+                .map((line, i) => `${i + 1}: ${line}`)
+                .join('\n');
+              parts.push(`# ${p} (${lines.length} lines)\n${numbered}`);
+            }
+          } catch (err: any) {
+            parts.push(`# ${p}\n[读取失败: ${err.message}]`);
+          }
+        }
+        const joined = paths.length > 1
+          ? parts.join('\n\n' + '═'.repeat(40) + '\n\n')
+          : parts[0];
+        return truncate(joined || '(empty)', maxOut);
       },
     }),
 

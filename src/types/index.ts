@@ -30,6 +30,22 @@ export interface Task {
   /** 调度器现场为该任务编写的完整指令（传给执行模型，用户不需要写） */
   prompt: string;
 
+  /**
+   * 该任务的工作目录（绝对路径）。
+   *
+   * agent 的所有文件操作（read_file / write_file / glob / grep / bash cwd）
+   * 都被限制在此目录内，无法访问外部路径。
+   *
+   * 调度器为每个 task 指定 workdir：
+   *   - 从零创建的任务：留空 → 系统给一个隔离的 .looppool-workspace/<taskId>/ 当 sandbox
+   *   - 侦察/优化/重构现有项目：必须填项目根目录的绝对路径（如 D:\\Projects\\user）
+   *   - validate 任务：通常与被验收任务的 workdir 相同（默认复用 targetTaskId 的）
+   *
+   * 如果 workdir 指向的目录不存在，agent 会报告"目录不存在"并停止——
+   * 调度器不能臆造路径，必须从用户需求或侦察结果中拿到真实路径。
+   */
+  workdir?: string;
+
   /** 附加输入 */
   input?: {
     /** validate 任务：要验收的目标任务 ID */

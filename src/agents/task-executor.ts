@@ -18,6 +18,8 @@ export class TaskExecutor {
   private registry: ModelRegistry;
   private engine: AgentEngine;
   private resultCache: Map<string, ExecutionResult> = new Map();
+  /** 记录每个 task 的 workdir，validate 任务可复用被验收任务的 workdir */
+  private workdirCache: Map<string, string> = new Map();
 
   constructor(registry: ModelRegistry, timeoutDefault: number = 1800000) {
     this.registry = registry;
@@ -30,11 +32,18 @@ export class TaskExecutor {
     const result = await this.engine.run(preparedTask, model);
 
     this.resultCache.set(task.id, result);
+    // 记录 workdir，供 validate 任务复用
+    if (preparedTask.workdir) {
+      this.workdirCache.set(task.id, preparedTask.workdir);
+    }
     return result;
   }
 
   /**
-   * 验收任务：把目标任务的输出拼进 prompt，让验收模型能看到被验收的内容
+   * 验收任务准备：把目标任务的输出拼进 prompt，并复用其 workdir
+   *
+   * validate 任务默认不指定 workdir 时，复用被验收任务的 workdir——
+   * 这样验收 agent 能直接 read_file 被验收的产物，不用绕 bash。
    */
   private prepareTask(task: Task): Task {
     if (task.kind !== 'validate' || !task.input?.targetTaskId) {
@@ -56,7 +65,11 @@ export class TaskExecutor {
       `${typeof target.output === 'string' ? target.output : JSON.stringify(target.output, null, 2)}` +
       criteria;
 
-    return { ...task, prompt: augmentedPrompt };
+    // validate 任务未显式指定 workdir 时，复用被验收任务的 workdir
+    const targetWorkdir = this.workdirCache.get(task.input.targetTaskId);
+    const workdir = task.workdir ?? targetWorkdir;
+
+    return { ...task, prompt: augmentedPrompt, workdir };
   }
 
   getTaskResult(taskId: string): ExecutionResult | undefined {
