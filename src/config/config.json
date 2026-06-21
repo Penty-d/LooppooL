@@ -1,6 +1,6 @@
 {
   "system": {
-    "maxIterations": 5,
+    "maxIterations": 20,
     "taskTimeout": 1800000,
     "globalParallelLimit": 10,
     "validationThreshold": 80

@@ -49,7 +49,11 @@ export async function main() {
     // 从命令行参数预填需求（可选），否则 App 内部用输入框收集
     const initialRequest = process.argv[2] || '';
 
-    const { unmount } = render(
+    // keep-alive interval：阻止 Node 进程在 stdin 暂停或 promise resolve 后
+    // 立即退出，让 TUI 能停留在总结面板等用户按 q
+    const keepAlive = setInterval(() => {}, 1 << 30);
+
+    const { unmount, waitUntilExit } = render(
       <App
         initialRequest={initialRequest}
         loopPool={loopPool}
@@ -57,13 +61,22 @@ export async function main() {
         onDone={() => {
           if (!isTty) {
             setTimeout(() => {
+              clearInterval(keepAlive);
               unmount();
               process.exit(0);
             }, 500);
           }
+          // TTY 模式：不在这里退出。Ink 的 useApp().exit() 会触发 waitUntilExit resolve
         }}
-      />
+      />,
+      { exitOnCtrlC: false }
     );
+
+    // 等 Ink 实例真正退出（由用户按 q 触发 exit()）才清理并结束进程
+    waitUntilExit().then(() => {
+      clearInterval(keepAlive);
+      process.exit(0);
+    });
   } catch (error) {
     logError('启动错误', error);
     process.exit(1);

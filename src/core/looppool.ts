@@ -1,4 +1,4 @@
-import { Context, Decision, Config, ModelsConfig } from '../types';
+import { Context, Decision, ExecutionPlan, Config, ModelsConfig } from '../types';
 import { TaskExecutor } from '../agents';
 import { ModelRegistry } from '../execution/model-registry';
 import { AnthropicClient } from '../llm';
@@ -68,7 +68,6 @@ export class LoopPool {
         pendingPlan = undefined;
 
         const taskCount = plan.stages.reduce((s, st) => s + st.tasks.length, 0);
-        console.log(`  [debug] iter ${iteration}: stages=${plan.stages.length} tasks=${taskCount} source=${usedNewPlan ? 'newPlan' : 'generatePlan'}`);
 
         // 防"无限空迭代"：plan 里一个 task 都没有，直接报错退出
         if (taskCount === 0) {

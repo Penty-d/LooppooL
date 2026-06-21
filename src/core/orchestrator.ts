@@ -52,8 +52,6 @@ export class Orchestrator {
 
     // DEBUG：无论解析成功与否，都把原始输出落盘，方便排查"空 plan / 一直迭代"
     const debugDump = dumpRawLog(context.requestId, `plan-raw-iter${context.history.length + 1}`, text);
-    console.log(`  [debug] 调度器原始输出 ${text.length} 字符 → ${debugDump.relativePath}`);
-    console.log(`  [debug] 头 200 字符: ${text.slice(0, 200).replace(/\s+/g, ' ')}`);
 
     const plan = this.parsePlan(text, context.requestId);
     logPlanReady(plan.stages.length, this.countTasks(plan));
@@ -76,11 +74,8 @@ export class Orchestrator {
 
     // DEBUG：决策原始输出也落盘
     const debugDump = dumpRawLog(context.requestId, `decision-raw-iter${context.history.length + 1}`, text);
-    console.log(`  [debug] 决策原始输出 ${text.length} 字符 → ${debugDump.relativePath}`);
-    console.log(`  [debug] 头 300 字符: ${text.slice(0, 300).replace(/\s+/g, ' ')}`);
 
     const decision = this.parseDecision(text, context.requestId);
-    console.log(`  [debug] 决策: shouldContinue=${decision.shouldContinue} score=${decision.qualityScore} hasNewPlan=${!!decision.newPlan} hasFinal=${!!decision.finalResult}`);
     logDecision(decision.shouldContinue, decision.qualityScore, decision.reason);
     return decision;
   }

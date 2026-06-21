@@ -60,7 +60,10 @@ function safePath(ctx: ToolContext, target: string): string {
   const rel = relative(ctx.workspace, real);
   if (rel.startsWith('..') || isAbsolute(rel)) {
     throw new Error(
-      `路径越界：${target}（必须在 workspace ${ctx.workspace} 内）`
+      `[ACCESS_DENIED] 路径 "${target}" 不在工作目录内，**这是硬性边界，禁止尝试任何其他写法绕过**。\n` +
+      `你的 workdir：${ctx.workspace}\n` +
+      `如果你认为需要访问外部路径，请在最终回复里明确说明"任务需要 workdir 之外的访问权限"并停止——` +
+      `不要用绝对路径、相对路径 ../、绕道 bash cd 等方式重试，所有尝试都会被拒绝。`
     );
   }
   return real;
@@ -70,6 +73,57 @@ function truncate(text: string, max: number): string {
   if (text.length <= max) return text;
   const head = text.slice(0, max);
   return `${head}\n\n[... 输出被截断，省略 ${text.length - max} 字符 ...]`;
+}
+
+/**
+ * 把工具调用参数规范化
+ *
+ * 某些第三方网关（方舟 / 火山 / 部分 LiteLLM 配置）把 OpenAI function-call
+ * 协议直接转给 Anthropic SDK，导致 tool input 变成奇形怪状，常见几种：
+ *
+ *   1) input = { raw_arguments: "{\"path\":\"...\",\"content\":\"...\"}" }
+ *      —— OpenAI 协议里 arguments 是字符串，被原样塞进了 Anthropic 的 input
+ *   2) input = { arguments: "..." }
+ *   3) input = "{\"path\":\"...\",\"content\":\"...\"}"
+ *      —— 整个 input 是 JSON 字符串
+ *
+ * 这个函数尝试把这些情况解开成 { path, content, ... } 的常规形态。
+ * expectedKeys 用来判断"是否已经是常规形态"——如果 input 直接含这些 key 就不动。
+ */
+function normalizeToolInput(input: any, expectedKeys: string[]): any {
+  if (input == null) return {};
+
+  // 已经是常规形态：直接含期望的 key
+  if (typeof input === 'object' && expectedKeys.some((k) => k in input)) {
+    return input;
+  }
+
+  // 整个 input 是 JSON 字符串
+  if (typeof input === 'string') {
+    try {
+      return JSON.parse(input);
+    } catch {
+      return {};
+    }
+  }
+
+  // input 是 { raw_arguments: "..." } 或 { arguments: "..." }
+  if (typeof input === 'object') {
+    for (const wrapKey of ['raw_arguments', 'arguments', 'input']) {
+      const wrapped = (input as any)[wrapKey];
+      if (typeof wrapped === 'string') {
+        try {
+          return JSON.parse(wrapped);
+        } catch {
+          // 解析失败，继续试其他 wrap key
+        }
+      } else if (wrapped && typeof wrapped === 'object') {
+        return wrapped;
+      }
+    }
+  }
+
+  return input;
 }
 
 /**
@@ -109,7 +163,11 @@ export function createTools(ctx: ToolContext) {
           .optional()
           .describe(`超时毫秒数，缺省 ${bashTimeout}`),
       }),
-      execute: async ({ command, cwd, timeout_ms }) => {
+      execute: async (input: any) => {
+        const { command, cwd, timeout_ms } = normalizeToolInput(input, ['command']);
+        if (typeof command !== 'string') {
+          throw new Error(`bash 参数无效：期望 { command: string }，收到 ${JSON.stringify(input).slice(0, 200)}`);
+        }
         const targetCwd = cwd ? safePath(ctx, cwd) : ctx.workspace;
         try {
           const { stdout, stderr } = await execAsync(command, {
@@ -160,7 +218,8 @@ export function createTools(ctx: ToolContext) {
           .optional()
           .describe('最多读多少行；缺省 2000（仅单文件时有效）'),
       }),
-      execute: async ({ path, offset = 1, limit = 2000 }) => {
+      execute: async (input: any) => {
+        const { path, offset = 1, limit = 2000 } = normalizeToolInput(input, ['path']);
         const paths = Array.isArray(path) ? path : [path];
         const parts: string[] = [];
         for (const p of paths) {
@@ -203,7 +262,18 @@ export function createTools(ctx: ToolContext) {
         path: z.string().describe('相对 workspace 的文件路径'),
         content: z.string().describe('文件完整内容'),
       }),
-      execute: async ({ path, content }) => {
+      execute: async (input: any) => {
+        // 容错：某些第三方网关（如方舟）会把 OpenAI 风格的 tool call 转给 Anthropic SDK，
+        // 导致 input 变成 { raw_arguments: "<json-string>" } 而不是直接 { path, content }。
+        // 检测并解开这种情况。
+        const args = normalizeToolInput(input, ['path', 'content']);
+        const { path, content } = args;
+        if (typeof path !== 'string' || typeof content !== 'string') {
+          throw new Error(
+            `write_file 参数无效：期望 { path, content } 都是字符串，` +
+            `实际收到 ${JSON.stringify(input).slice(0, 200)}`
+          );
+        }
         const abs = safePath(ctx, path);
         await mkdir(dirname(abs), { recursive: true });
         await fsWriteFile(abs, content, 'utf-8');
@@ -225,7 +295,11 @@ export function createTools(ctx: ToolContext) {
           .optional()
           .describe('要排除的 glob 列表'),
       }),
-      execute: async ({ pattern, ignore }) => {
+      execute: async (input: any) => {
+        const { pattern, ignore } = normalizeToolInput(input, ['pattern']);
+        if (typeof pattern !== 'string') {
+          throw new Error(`glob 参数无效：期望 { pattern: string }，收到 ${JSON.stringify(input).slice(0, 200)}`);
+        }
         const matches = await globCb(pattern, {
           cwd: ctx.workspace,
           ignore: ['node_modules/**', 'dist/**', '.git/**', ...(ignore ?? [])],
@@ -252,7 +326,11 @@ export function createTools(ctx: ToolContext) {
           .optional()
           .describe('正则 flags，缺省 "g"，常用 "gi" 忽略大小写'),
       }),
-      execute: async ({ pattern, include, flags = 'g' }) => {
+      execute: async (input: any) => {
+        const { pattern, include, flags = 'g' } = normalizeToolInput(input, ['pattern']);
+        if (typeof pattern !== 'string') {
+          throw new Error(`grep 参数无效：期望 { pattern: string }，收到 ${JSON.stringify(input).slice(0, 200)}`);
+        }
         const files = await globCb(include ?? '**/*', {
           cwd: ctx.workspace,
           ignore: ['node_modules/**', 'dist/**', '.git/**'],
