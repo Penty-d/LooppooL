@@ -135,6 +135,11 @@ export class AgentEngine {
     } else {
       opts.apiKey = model.apiKey;
     }
+    // 自定义 fetch：兼容方舟等第三方 anthropic 网关的响应瑕疵
+    //   方舟 glm-5.2 返回 thinking block 时缺 signature 字段，
+    //   @ai-sdk/anthropic 严格校验会抛 TypeValidationError。
+    //   这里拦截响应给 thinking block 补一个占位 signature。
+    opts.fetch = patchThinkingSignature;
     return createAnthropic(opts);
   }
 
@@ -169,6 +174,8 @@ ${envInfo}
 1. **先调查再动手**：改文件前先 read_file / glob / grep 看清现状，禁止凭空编造路径和代码结构。
 2. **写文件 = 覆盖整个文件**：write_file 会替换整个内容，部分修改也必须先 read_file 拼好完整内容再写。
 3. **批量并行调用**：多个独立的读取 / 搜索可以一次发起多个 tool call，不要串行排队。
+   **read_file 默认传数组一次读多个相关文件**——如 read_file({path:["a.ts","b.ts","c.ts"]})，
+   不要一个一个读浪费时间往返。
 4. **遇错三步**：① 看 stderr 找原因；② 提一个最具体的修复假设；③ 用一条最小命令验证假设。同一个错误最多重试 2 次，再失败就停下说明。命令报"找不到 cmdlet"通常是 shell 语法用错了——切换到当前 shell 的等价命令。
 5. **不要假装成功**：完不成就直说"无法完成 + 原因 + 已经尝试过什么"。
 6. **简洁、就事论事**：不寒暄、不为自己辩护、不重复贴大段代码、不解释你"接下来要做什么"——直接做。`;
@@ -403,3 +410,64 @@ ${envInfo}
     }
   }
 }
+
+/**
+ * 自定义 fetch 包装器：给 thinking content block 补 signature 字段
+ *
+ * 背景：@ai-sdk/anthropic 严格校验 Anthropic 协议，要求 thinking block 必须带
+ * signature 字段（extended thinking 协议）。但方舟（火山引擎）等第三方网关
+ * 返回 thinking block 时不带 signature，导致 SDK 抛 TypeValidationError。
+ *
+ * 这里拦截 /v1/messages 响应，给所有缺 signature 的 thinking block 补一个
+ * 占位值，让 SDK 校验通过。占位 signature 不会被用于实际验证（第三方网关
+ * 不做 signature 校验），纯粹是满足 schema。
+ */
+async function patchThinkingSignature(
+  url: string | URL | Request,
+  init?: RequestInit
+): Promise<Response> {
+  const res = await fetch(url as any, init as any);
+  // 只处理 messages API 的 JSON 响应
+  const ct = res.headers.get('content-type') || '';
+  if (!ct.includes('application/json')) return res;
+
+  const text = await res.text();
+  try {
+    const data = JSON.parse(text);
+    if (data && Array.isArray(data.content)) {
+      let patched = false;
+      for (const block of data.content) {
+        if (block && block.type === 'thinking' && block.signature === undefined) {
+          block.signature = 'patched-by-looppool';
+          patched = true;
+        }
+      }
+      if (patched) {
+        return new Response(JSON.stringify(data), {
+          status: res.status,
+          statusText: res.statusText,
+          headers: res.headers,
+        });
+      }
+    }
+  } catch {
+    // JSON 解析失败，原样返回
+  }
+  // 没改动，重建一个等价 Response（text 已被消费）
+  return new Response(text, {
+    status: res.status,
+    statusText: res.statusText,
+    headers: res.headers,
+  });
+}
+
+/**
+ * 自定义 fetch 包装器：给方舟等第三方网关的 thinking block 补 signature 字段
+ *
+ * 背景：@ai-sdk/anthropic 严格要求 thinking content block 带 signature 字段
+ * （Anthropic extended thinking 协议）。方舟 glm-5.2 返回 thinking 但没 signature，
+ * 导致 SDK 校验失败、抛 Invalid JSON response。
+ *
+ * 实现：拦截 /v1/messages 响应，解析 JSON，给缺 signature 的 thinking block
+ * 补一个占位值，再重新序列化返回给 SDK。
+ */

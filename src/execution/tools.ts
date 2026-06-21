@@ -8,8 +8,9 @@ import {
   mkdir,
   stat,
 } from 'fs/promises';
-import { resolve as pathResolve, relative, dirname, isAbsolute } from 'path';
+import { resolve as pathResolve, relative, dirname, basename, isAbsolute } from 'path';
 import { glob as globCb } from 'glob';
+import { realpathSync } from 'fs';
 
 const execAsync = promisify(exec);
 
@@ -26,17 +27,43 @@ const DEFAULT_BASH_TIMEOUT = 60_000;
 const DEFAULT_MAX_OUTPUT = 100_000; // ~100KB，避免一次回灌把 context 撑爆
 
 /**
- * 把可能越界的路径拍回 workspace 内
+ * 把可能越界的路径拍回 workspace 内。
+ *
+ * 除规范化检查外，通过 realpathSync 解析符号链接真实路径，
+ * 防止通过 symlink 逃逸出 workdir。目标文件尚不存在时（如 write_file
+ * 创建新文件）捕获 ENOENT，改为对父目录做 realpath 校验。
  */
 function safePath(ctx: ToolContext, target: string): string {
   const abs = isAbsolute(target) ? target : pathResolve(ctx.workspace, target);
-  const rel = relative(ctx.workspace, abs);
+
+  // 解析符号链接真实路径，防止 symlink 逃逸
+  let real: string;
+  try {
+    real = realpathSync(abs);
+  } catch (err: any) {
+    if (err.code === 'ENOENT') {
+      // 目标文件尚不存在（write_file 场景），对父目录做 realpath 校验
+      const parent = dirname(abs);
+      try {
+        const realParent = realpathSync(parent);
+        real = pathResolve(realParent, basename(abs));
+      } catch {
+        // 父目录也不存在，回退到规范化路径校验
+        real = abs;
+      }
+    } else {
+      // 其他错误（权限等），回退到规范化路径
+      real = abs;
+    }
+  }
+
+  const rel = relative(ctx.workspace, real);
   if (rel.startsWith('..') || isAbsolute(rel)) {
     throw new Error(
       `路径越界：${target}（必须在 workspace ${ctx.workspace} 内）`
     );
   }
-  return abs;
+  return real;
 }
 
 function truncate(text: string, max: number): string {
@@ -112,25 +139,26 @@ export function createTools(ctx: ToolContext) {
 
     read_file: tool({
       description:
-        '读取 workspace 内的文本文件。支持一次读多个文件（传 path 数组），' +
-        '也支持可选行范围（对单个文件有效；多文件时读全部）。' +
-        '每个文件内容带文件名头，超长截断。',
+        '读取 workspace 内的文本文件。**默认就传数组一次读多个相关文件**（如 ["a.ts","b.ts","c.ts"]），' +
+        '减少往返次数——只有明确只读一个文件时才传单字符串。' +
+        '单个文件支持可选行范围（offset/limit）；多文件时读全部内容。' +
+        '每个文件内容带文件名头，整体超长截断。',
       inputSchema: z.object({
         path: z
-          .union([z.string(), z.array(z.string())])
-          .describe('相对 workspace 的文件路径，可传单个字符串或数组（一次读多个）'),
+          .array(z.string())
+          .describe('要读取的文件路径数组（相对 workspace），如 ["src/index.ts","README.md"]。即使只读一个也用数组 ["a.ts"]'),
         offset: z
           .number()
           .int()
           .nonnegative()
           .optional()
-          .describe('从第几行开始读，1 起；缺省 1（仅对单文件有效）'),
+          .describe('从第几行开始读，1 起；缺省 1（仅单文件时有效）'),
         limit: z
           .number()
           .int()
           .positive()
           .optional()
-          .describe('最多读多少行；缺省 2000（仅对单文件有效）'),
+          .describe('最多读多少行；缺省 2000（仅单文件时有效）'),
       }),
       execute: async ({ path, offset = 1, limit = 2000 }) => {
         const paths = Array.isArray(path) ? path : [path];

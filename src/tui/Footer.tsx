@@ -33,7 +33,7 @@ export function Footer({
   }
 
   const left = finished
-    ? '执行已结束 · 按 q 退出'
+    ? '执行已结束 · Enter/s 切换总结/详情 · q 退出'
     : `↑↓ 切任务 (${selectedIdx + 1}/${taskCount || 1}) · 滚轮看详情 · Enter 展开 · q 退出`;
 
   const rightParts: string[] = [];

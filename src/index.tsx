@@ -17,16 +17,16 @@ const ENTER_ALT_SCREEN = '\x1b[?1049h';
 const EXIT_ALT_SCREEN = '\x1b[?1049l';
 const HIDE_CURSOR = '\x1b[?25l';
 const SHOW_CURSOR = '\x1b[?25h';
-// 启用鼠标跟踪（1000=基本按钮，1006=SGR 格式，让滚轮发 \x1B[<64;...M / \x1B[<65;...M）
-const ENABLE_MOUSE = '\x1b[?1000h\x1b[?1006h';
-const DISABLE_MOUSE = '\x1b[?1000l\x1b[?1006l';
 
 function enterFullscreen(): void {
-  process.stdout.write(ENTER_ALT_SCREEN + HIDE_CURSOR + ENABLE_MOUSE);
+  // 注意：不在这里开鼠标跟踪——输入态开鼠标会导致序列泄漏到文本框
+  // 鼠标跟踪由 App 组件按 phase 切换（执行态开、输入态关）
+  process.stdout.write(ENTER_ALT_SCREEN + HIDE_CURSOR);
 }
 
 function exitFullscreen(): void {
-  process.stdout.write(DISABLE_MOUSE + SHOW_CURSOR + EXIT_ALT_SCREEN);
+  // 退出时确保关掉鼠标跟踪（无论当前状态）
+  process.stdout.write('\x1b[?1006l\x1b[?1000l' + SHOW_CURSOR + EXIT_ALT_SCREEN);
 }
 
 export async function main() {

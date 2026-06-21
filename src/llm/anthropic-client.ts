@@ -38,7 +38,10 @@ export class AnthropicClient {
   }
 
   /**
-   * 发送一次补全请求，返回纯文本响应
+   * 发送一次补全请求，返回纯文本响应。
+   *
+   * 对网络错误 / 5xx / 429 做最多 3 次重试（指数退避 500ms / 1s / 2s），
+   * 重试耗尽后抛出原始错误。4xx（除 429）不重试，直接抛出。
    *
    * @param systemPrompt 系统提示（角色设定）
    * @param userPrompt   用户消息（实际请求内容）
@@ -54,37 +57,64 @@ export class AnthropicClient {
       headers['x-api-key'] = this.apiKey;
     }
 
-    const res = await fetch(`${this.baseURL}/v1/messages`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({
-        model: this.modelId,
-        max_tokens: this.maxTokens,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
-      }),
+    const body = JSON.stringify({
+      model: this.modelId,
+      max_tokens: this.maxTokens,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
     });
+    const url = `${this.baseURL}/v1/messages`;
+    const maxRetries = 3;
+    let lastError: Error | undefined;
 
-    if (!res.ok) {
-      const errBody = await res.text();
-      throw new Error(`调度器 API 调用失败 (${res.status}): ${errBody}`);
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      let res: Response;
+      try {
+        res = await fetch(url, { method: 'POST', headers, body });
+      } catch (err: any) {
+        // 网络错误（DNS / 连接拒绝 / 超时等），可重试
+        lastError = err;
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+          continue;
+        }
+        throw lastError;
+      }
+
+      // 5xx / 429 可重试
+      if (res.status === 429 || res.status >= 500) {
+        const errBody = await res.text();
+        lastError = new Error(`调度器 API 调用失败 (${res.status}): ${errBody}`);
+        if (attempt < maxRetries) {
+          await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+          continue;
+        }
+        throw lastError;
+      }
+
+      if (!res.ok) {
+        const errBody = await res.text();
+        throw new Error(`调度器 API 调用失败 (${res.status}): ${errBody}`);
+      }
+
+      const data: any = await res.json();
+
+      // content 是 block 数组，提取所有 text block 拼接
+      const text = Array.isArray(data.content)
+        ? data.content
+            .filter((b: any) => b.type === 'text')
+            .map((b: any) => b.text)
+            .join('')
+        : '';
+
+      if (!text) {
+        throw new Error(`调度器 API 返回空内容: ${JSON.stringify(data)}`);
+      }
+
+      return text;
     }
 
-    const data: any = await res.json();
-
-    // content 是 block 数组，提取所有 text block 拼接
-    const text = Array.isArray(data.content)
-      ? data.content
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('')
-      : '';
-
-    if (!text) {
-      throw new Error(`调度器 API 返回空内容: ${JSON.stringify(data)}`);
-    }
-
-    return text;
+    throw lastError!;
   }
 
   get model(): string {

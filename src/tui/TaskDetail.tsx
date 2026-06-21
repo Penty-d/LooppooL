@@ -98,20 +98,6 @@ export function TaskDetail({
   if (maxHeight !== undefined) {
     const start = Math.max(0, Math.min(scroll, Math.max(0, lines.length - maxHeight)));
     visible = lines.slice(start, start + maxHeight);
-    // 滚动指示
-    const total = lines.length;
-    const showingEnd = Math.min(start + maxHeight, total);
-    const indicator = total > maxHeight
-      ? ` [${start + 1}-${showingEnd}/${total} · PgUp/PgDn 滚动]`
-      : '';
-    if (indicator) {
-      visible = [
-        ...visible,
-        <Box key="scroll-indicator">
-          <Text dimColor>{indicator}</Text>
-        </Box>,
-      ];
-    }
   }
 
   return <Box flexDirection="column">{visible}</Box>;

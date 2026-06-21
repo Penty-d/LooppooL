@@ -322,13 +322,15 @@ export function useTuiState(): TuiState {
       'final-result',
       'log',
     ];
-    const unsubscribers = types.map((type) =>
-      bus.on(type, (payload: any) => {
+    const subscriptions = types.map((type) => {
+      const listener = (payload: any) => {
         dispatch({ type: 'event', event: { type, payload } as UiEvent });
-      })
-    );
+      };
+      bus.on(type, listener);
+      return { type, listener };
+    });
     return () => {
-      unsubscribers.forEach((u) => u);
+      subscriptions.forEach(({ type, listener }) => bus.off(type, listener));
     };
   }, []);
 

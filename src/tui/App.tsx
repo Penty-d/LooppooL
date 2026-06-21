@@ -1,9 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Text, Box, useApp, useStdout, useStdin } from 'ink';
 import TextInput from 'ink-text-input';
 import { useTuiState, toggleTask, TuiState, TaskEntry } from './state';
 import { TaskList } from './TaskList';
 import { TaskDetail } from './TaskDetail';
+import { Summary } from './Summary';
 import { Footer } from './Footer';
 import { printFinalResult, logError } from '../ui';
 import type { LoopPool } from '../core';
@@ -35,6 +36,18 @@ export function App({
   const { stdout } = useStdout();
   const { isRawModeSupported } = useStdin();
 
+  // 按 phase 切换鼠标跟踪：
+  //   输入态关掉——避免鼠标序列泄漏到 TextInput 被当成普通字符
+  //   执行态开启——让滚轮能滚动详情面板
+  useEffect(() => {
+    if (!isTty) return;
+    if (phase === 'running') {
+      process.stdout.write('\x1b[?1000h\x1b[?1006h');
+    } else {
+      process.stdout.write('\x1b[?1006l\x1b[?1000l');
+    }
+  }, [phase, isTty]);
+
   const state = useTuiState();
   const [localState, setLocalState] = useState<TuiState>(state);
   useEffect(() => setLocalState(state), [state]);
@@ -42,13 +55,30 @@ export function App({
   const allTasks = collectAllTasks(state);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const [detailScroll, setDetailScroll] = useState(0);
+  // 完成后右栏默认显示调度器总结，按 Enter 切换到 task 详情浏览
+  const [showSummary, setShowSummary] = useState(false);
+  useEffect(() => {
+    if (localState.finalResult) setShowSummary(true);
+  }, [localState.finalResult]);
 
   // 选中项变化时重置滚动
   useEffect(() => {
     setDetailScroll(0);
   }, [selectedIdx, allTasks[selectedIdx]?.uid]);
 
-  // 键盘交互（仅执行态需要）
+  // 用 ref 存最新的 allTasks / selectedIdx / localState，
+  // 让 stdin 监听只订阅一次（不随每次渲染重订阅），避免 cleanup 时 setRawMode(false)
+  // 导致进程意外退出
+  const allTasksRef = useRef(allTasks);
+  const selectedIdxRef = useRef(selectedIdx);
+  const localStateRef = useRef(localState);
+  const onDoneRef = useRef(onDone);
+  allTasksRef.current = allTasks;
+  selectedIdxRef.current = selectedIdx;
+  localStateRef.current = localState;
+  onDoneRef.current = onDone;
+
+  // 键盘交互（仅执行态需要）—— 只在 phase / isTty 变化时重订阅
   useEffect(() => {
     if (phase !== 'running') return;
     if (!isTty || !isRawModeSupported) return;
@@ -58,7 +88,7 @@ export function App({
       // q / Ctrl+C 退出
       if (s === 'q' || s === '\x03') {
         exit();
-        onDone?.();
+        onDoneRef.current?.();
         return;
       }
 
@@ -67,26 +97,29 @@ export function App({
       if (wheelMatch) {
         const btn = parseInt(wheelMatch[1], 10);
         if (btn === 64) {
-          // 滚轮上 → 详情上滚
           setDetailScroll((i) => Math.max(0, i - 3));
         } else if (btn === 65) {
-          // 滚轮下 → 详情下滚
           setDetailScroll((i) => i + 3);
         }
         return;
       }
 
-      if (allTasks.length === 0) return;
+      const tasks = allTasksRef.current;
+      if (tasks.length === 0) return;
 
-      // 上下方向键：切换任务（左栏）
       if (s === '\x1B[A') {
         setSelectedIdx((i) => Math.max(0, i - 1));
+        setShowSummary(false);
       } else if (s === '\x1B[B') {
-        setSelectedIdx((i) => Math.min(allTasks.length - 1, i + 1));
-      } else if (s === '\r' || s === 'l') {
-        // Enter / l：展开切换（用 uid 避免同名 task 撞车）
-        const t = allTasks[selectedIdx];
-        if (t) setLocalState((prev) => toggleTask(prev, t.uid));
+        setSelectedIdx((i) => Math.min(tasks.length - 1, i + 1));
+        setShowSummary(false);
+      } else if (s === '\r' || s === 'l' || s === 's') {
+        if (localStateRef.current.finalResult) {
+          setShowSummary((v) => !v);
+        } else {
+          const t = tasks[selectedIdxRef.current];
+          if (t) setLocalState((prev) => toggleTask(prev, t.uid));
+        }
       }
     };
 
@@ -97,7 +130,7 @@ export function App({
       process.stdin.removeListener('data', onData);
       try { process.stdin.setRawMode(false); } catch { /* ignore */ }
     };
-  }, [phase, isTty, isRawModeSupported, allTasks, selectedIdx, exit, onDone]);
+  }, [phase, isTty, isRawModeSupported, exit]);
 
   // 启动 LoopPool
   useEffect(() => {
@@ -106,13 +139,13 @@ export function App({
       .execute(request)
       .then((result) => {
         if (result?.result) printFinalResult(result.result);
-        onDone?.();
+        onDoneRef.current?.();
       })
       .catch((err) => {
         logError('运行错误', err);
-        onDone?.();
+        onDoneRef.current?.();
       });
-  }, [phase, request, loopPool, onDone]);
+  }, [phase, request, loopPool]);
 
   const cols = stdout.columns || 80;
   const rows = stdout.rows || 24;
@@ -173,6 +206,11 @@ export function App({
             <TaskDetail task={selectedTask} width={cols} maxHeight={undefined} scroll={0} />
           </Box>
         )}
+        {localState.finalResult && (
+          <Box marginTop={1} flexDirection="column">
+            <Summary result={localState.finalResult} width={cols} />
+          </Box>
+        )}
         <Footer
           finished={finished}
           isTty={false}
@@ -204,7 +242,9 @@ export function App({
         </Box>
         <Box width={1} />
         <Box width={rightWidth} borderStyle="single" flexDirection="column" paddingX={1}>
-          {selectedTask ? (
+          {showSummary && localState.finalResult ? (
+            <Summary result={localState.finalResult} width={rightWidth - 2} />
+          ) : selectedTask ? (
             <TaskDetail task={selectedTask} width={rightWidth - 2} maxHeight={bodyHeight - 2} scroll={detailScroll} />
           ) : (
             <Text dimColor>（选择左侧任务查看详情）</Text>

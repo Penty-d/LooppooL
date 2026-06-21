@@ -153,6 +153,11 @@ class UiEventBus extends EventEmitter {
     return super.on(type, listener);
   }
 
+  off(type: UiEvent['type'], listener: (payload: any) => void): this {
+    super.removeListener(type, listener);
+    return this;
+  }
+
   /** 发任意事件，给 ui.ts 用 */
   dispatch(event: UiEvent): void {
     this.emit(event.type, event.payload);
