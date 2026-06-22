@@ -27,10 +27,17 @@ export function TaskList({
   const lines: React.ReactNode[] = [];
   // 记录每个 task 行在 lines 中的位置，用于滚动跟随
   const taskLinePositions: { uid: string; lineIdx: number }[] = [];
+  // 全局行计数器，用作 React key——保证每个行元素 key 唯一且稳定，
+  // 不会因 slice 滚动导致 key 重复/错位（之前的语义 key 如 stage-1
+  // 在不同迭代里会重名，滚动后 React 复用错实例）
+  let lineKey = 0;
+  const pushLine = (node: React.ReactNode) => {
+    lines.push(<React.Fragment key={lineKey++}>{node}</React.Fragment>);
+  };
 
   for (const it of state.iterations) {
-    lines.push(
-      <Box key={`iter-${it.iteration}`}>
+    pushLine(
+      <Box>
         <Text color="cyan" bold>
           ● 迭代 {it.iteration}/{it.maxIterations}
         </Text>
@@ -46,16 +53,16 @@ export function TaskList({
     );
 
     if (it.reasoning) {
-      lines.push(
-        <Box key={`reason-${it.iteration}`} marginLeft={1}>
+      pushLine(
+        <Box marginLeft={1}>
           <Text dimColor>{truncate(it.reasoning, width - 2)}</Text>
         </Box>
       );
     }
 
     for (const st of it.stages) {
-      lines.push(
-        <Box key={`stage-${st.id}`} marginLeft={1}>
+      pushLine(
+        <Box marginLeft={1}>
           <Text bold color={st.summary && st.summary.success < st.summary.total ? 'red' : 'green'}>
             {st.summary ? '✓' : '○'}
           </Text>
@@ -77,8 +84,8 @@ export function TaskList({
         const line = `${marker} ${statusIcon} ${tag} ${truncate(t.taskId, 10)} ${desc} ${toolCount}t ${dur}`;
 
         taskLinePositions.push({ uid: t.uid, lineIdx: lines.length });
-        lines.push(
-          <Box key={t.uid} marginLeft={1}>
+        pushLine(
+          <Box marginLeft={1}>
             <Text
               color={isSelected ? 'black' : undefined}
               backgroundColor={isSelected ? 'cyan' : undefined}

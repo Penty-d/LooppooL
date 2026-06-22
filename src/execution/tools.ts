@@ -59,11 +59,28 @@ function safePath(ctx: ToolContext, target: string): string {
 
   const rel = relative(ctx.workspace, real);
   if (rel.startsWith('..') || isAbsolute(rel)) {
+    // DEBUG：把路径细节嵌入错误消息本身，避免 console.error 被 Ink 渲染冲掉
+    const debugLine =
+      `[DBG] ws=${JSON.stringify(ctx.workspace)} (len=${ctx.workspace.length}) ` +
+      `target=${JSON.stringify(target)} (len=${target.length}) ` +
+      `abs=${JSON.stringify(abs)} real=${JSON.stringify(real)} (len=${real.length}) ` +
+      `rel=${JSON.stringify(rel)}`;
     throw new Error(
-      `[ACCESS_DENIED] 路径 "${target}" 不在工作目录内，**这是硬性边界，禁止尝试任何其他写法绕过**。\n` +
-      `你的 workdir：${ctx.workspace}\n` +
-      `如果你认为需要访问外部路径，请在最终回复里明确说明"任务需要 workdir 之外的访问权限"并停止——` +
-      `不要用绝对路径、相对路径 ../、绕道 bash cd 等方式重试，所有尝试都会被拒绝。`
+      `[ACCESS_DENIED] 路径越界。\n` +
+      `  你试图访问：${target}\n` +
+      `  解析后的真实路径：${real}\n` +
+      `  允许的工作目录（WORKDIR）：${ctx.workspace}\n` +
+      `\n` +
+      `这是硬性边界，禁止以任何方式绕过：\n` +
+      `  · 不要换个绝对路径重试（如 D:\\Projects\\xxx）\n` +
+      `  · 不要用 ../ 跨目录\n` +
+      `  · 不要用 bash cd 绕道\n` +
+      `\n` +
+      `**重要**：如果你试图访问的路径看起来"应该是项目"，那是你的幻觉——\n` +
+      `WORKDIR 才是真实的项目位置。请把所有路径改成相对 WORKDIR 的形式。\n` +
+      `\n` +
+      `如果任务确实需要 WORKDIR 之外的访问权限，请在最终回复里说明并停止——不要继续尝试。\n` +
+      `\n${debugLine}`
     );
   }
   return real;

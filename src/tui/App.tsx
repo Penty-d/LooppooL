@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Text, Box, useApp, useStdout, useStdin } from 'ink';
+import { Text, Box, useApp, useStdout, useStdin, useInput } from 'ink';
 import TextInput from 'ink-text-input';
 import { useTuiState, toggleTask, TuiState, TaskEntry } from './state';
 import { TaskList } from './TaskList';
@@ -149,6 +149,16 @@ export function App({
 
   const cols = stdout.columns || 80;
   const rows = stdout.rows || 24;
+
+  // 全局 Ctrl+C 退出（输入态 / 执行态都生效）
+  // 输入态 ink-text-input 用 useInput 拦截了 Ctrl+C 不处理，且 Ink 的 exitOnCtrlC=false，
+  // 所以必须自己监听一份。执行态我们手写 stdin 监听也处理 Ctrl+C，两层兜底。
+  useInput((input, key) => {
+    if (key.ctrl && input === 'c') {
+      exit();
+      onDoneRef.current?.();
+    }
+  }, { isActive: isRawModeSupported === true });
 
   // ───────── 输入态 ─────────
   if (phase === 'input') {

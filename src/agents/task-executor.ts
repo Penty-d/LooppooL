@@ -29,7 +29,18 @@ export class TaskExecutor {
   async execute(task: Task): Promise<ExecutionResult> {
     const preparedTask = this.prepareTask(task);
     const model = this.registry.resolve(preparedTask.model);
-    const result = await this.engine.run(preparedTask, model);
+
+    // 在 task.prompt 头部强制注入 workdir 信息（user message，比 system prompt 注意力更强）
+    // 让 agent 在"读完任务要求"那一刻就知道自己应该在哪工作
+    const workdirLine = preparedTask.workdir
+      ? `【工作目录】${preparedTask.workdir}\n\n你必须在 "${preparedTask.workdir}" 内工作，所有文件路径基于此目录。\n除非任务明确要求访问外部路径，否则不要使用其他绝对路径。\n\n`
+      : '';
+    const injectedTask = {
+      ...preparedTask,
+      prompt: workdirLine + preparedTask.prompt,
+    };
+
+    const result = await this.engine.run(injectedTask, model);
 
     this.resultCache.set(task.id, result);
     // 记录 workdir，供 validate 任务复用

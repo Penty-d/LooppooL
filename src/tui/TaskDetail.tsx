@@ -36,57 +36,62 @@ export function TaskDetail({
 
   // 把所有内容渲染成行数组，便于滚动裁剪
   const lines: React.ReactNode[] = [];
+  // 全局行计数器作 key，避免 slice 滚动后 key 重复/错位
+  let lineKey = 0;
+  const pushLine = (node: React.ReactNode) => {
+    lines.push(<React.Fragment key={lineKey++}>{node}</React.Fragment>);
+  };
 
   // 元信息
-  lines.push(
-    <Box key="meta1">
+  pushLine(
+    <Box>
       <Text bold color="cyan">{task.taskId}</Text>
       <Text dimColor> ({task.modelId}) </Text>
       <Text color={statusColor} bold>{statusText}</Text>
       <Text dimColor> · {dur} · {toolCount} tools</Text>
     </Box>
   );
-  lines.push(
-    <Box key="meta2">
+  pushLine(
+    <Box>
       <Text dimColor>{task.kind === 'execute' ? 'EXEC' : 'VALIDATE'}: </Text>
       <Text>{task.description}</Text>
     </Box>
   );
-  lines.push(
-    <Box key="sep">
+  pushLine(
+    <Box>
       <Text dimColor>{'─'.repeat(Math.max(1, width))}</Text>
     </Box>
   );
 
   // 时间线
   if (task.events.length === 0) {
-    lines.push(<Text key="empty" dimColor>（暂无工具调用，等待 agent 行动…）</Text>);
+    pushLine(<Text dimColor>（暂无工具调用，等待 agent 行动…）</Text>);
   }
   task.events.forEach((ev, i) => {
     if (ev.kind === 'tool-call') {
-      lines.push(
-        <Box key={`tc-${i}`}>
+      pushLine(
+        <Box>
           <Text color="blue">→ </Text>
           <Text color="blue" bold>{ev.toolName}</Text>
           <Text dimColor>{truncate(`(${ev.briefArgs})`, width - (ev.toolName?.length ?? 4) - 4)}</Text>
         </Box>
       );
     } else if (ev.kind === 'tool-result') {
-      lines.push(
-        <Box key={`tr-${i}`} marginLeft={2}>
+      pushLine(
+        <Box marginLeft={2}>
           <Text dimColor>↳ {truncate(ev.brief || '', width - 4)}</Text>
         </Box>
       );
     } else if (ev.kind === 'agent-text') {
-      lines.push(
-        <Box key={`at-${i}`} marginTop={1} flexDirection="column">
+      pushLine(
+        <Box marginTop={1} flexDirection="column">
           <Text color="yellow" bold>💬 agent:</Text>
           <Text color="yellow">  {truncate(ev.brief || '', width - 2)}</Text>
         </Box>
       );
     } else if (ev.kind === 'context-compaction') {
-      lines.push(
-        <Box key={`cc-${i}`}>
+      pushLine(
+        <Box>
           <Text color="yellowBright">⚠ context {ev.beforeTokens}→{ev.afterTokens} tokens (kept {ev.keptSteps} steps)</Text>
         </Box>
       );
