@@ -15,12 +15,15 @@ export function TaskList({
   state,
   tasks,
   selectedIdx,
+  selectedUid,
   width,
   maxHeight,
 }: {
   state: TuiState;
   tasks: TaskEntry[];
   selectedIdx: number;
+  /** 当前选中 task 的 uid，直接用它判断高亮，避免 findIndex 在滚动/并发时错位 */
+  selectedUid?: string;
   width: number;
   maxHeight?: number;
 }) {
@@ -72,8 +75,8 @@ export function TaskList({
       );
 
       st.tasks.forEach((t) => {
-        const idx = tasks.findIndex((x) => x.uid === t.uid);
-        const isSelected = idx === selectedIdx;
+        // 直接用 uid 比较，避免 findIndex 在 tasks 数组变化时返回错误索引
+        const isSelected = t.uid === selectedUid;
         const tag = t.kind === 'execute' ? 'E' : 'V';
         const statusIcon = t.ok === undefined ? '○' : t.ok ? '✓' : '✗';
         const dur = t.durationMs ? `${(t.durationMs / 1000).toFixed(1)}s` : '...';

@@ -209,6 +209,7 @@ export function App({
           state={localState}
           tasks={allTasks}
           selectedIdx={selectedIdx}
+          selectedUid={selectedTask?.uid}
           width={cols}
         />
         {selectedTask && (
@@ -218,7 +219,7 @@ export function App({
         )}
         {localState.finalResult && (
           <Box marginTop={1} flexDirection="column">
-            <Summary result={localState.finalResult} width={cols} />
+            <Summary result={localState.finalResult} width={cols} scroll={0} />
           </Box>
         )}
         <Footer
@@ -246,6 +247,7 @@ export function App({
             state={localState}
             tasks={allTasks}
             selectedIdx={selectedIdx}
+            selectedUid={allTasks[selectedIdx]?.uid}
             width={leftWidth - 2}
             maxHeight={bodyHeight - 2}
           />
@@ -253,7 +255,7 @@ export function App({
         <Box width={1} />
         <Box width={rightWidth} borderStyle="single" flexDirection="column" paddingX={1}>
           {showSummary && localState.finalResult ? (
-            <Summary result={localState.finalResult} width={rightWidth - 2} />
+            <Summary result={localState.finalResult} width={rightWidth - 2} maxHeight={bodyHeight - 2} scroll={detailScroll} />
           ) : selectedTask ? (
             <TaskDetail task={selectedTask} width={rightWidth - 2} maxHeight={bodyHeight - 2} scroll={detailScroll} />
           ) : (
