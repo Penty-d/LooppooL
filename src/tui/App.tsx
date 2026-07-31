@@ -6,7 +6,14 @@ import { TaskList } from './TaskList';
 import { TaskDetail } from './TaskDetail';
 import { Summary } from './Summary';
 import { Footer } from './Footer';
+import { ConfirmModal } from './ConfirmModal';
 import { printFinalResult, logError } from '../ui';
+import {
+  registerConfirmResponder,
+  unregisterConfirmResponder,
+  respondConfirm,
+} from '../confirm';
+import { PlanRejectedError } from '../errors';
 import type { LoopPool } from '../core';
 
 type Phase = 'input' | 'running';
@@ -21,11 +28,14 @@ type Phase = 'input' | 'running';
  */
 export function App({
   initialRequest,
+  resumeRequestId,
   loopPool,
   isTty,
   onDone,
 }: {
   initialRequest: string;
+  /** 非空表示本次是断点恢复：直接进 running 态并调用 loopPool.resume(id) */
+  resumeRequestId?: string | null;
   loopPool: LoopPool;
   isTty: boolean;
   onDone?: () => void;
@@ -78,6 +88,36 @@ export function App({
   localStateRef.current = localState;
   onDoneRef.current = onDone;
 
+  // ── 人工确认（计划审批 / 危险命令）──
+  const confirmQueueRef = useRef<{ id: string; message: string }[]>([]);
+  const [pendingConfirm, setPendingConfirm] = useState<{ id: string; message: string } | null>(null);
+  const [confirmScroll, setConfirmScroll] = useState(0);
+  // 让 onData 闭包读到最新 pendingConfirm（ref 同步模式，同 allTasksRef）
+  const pendingConfirmRef = useRef<typeof pendingConfirm>(null);
+  pendingConfirmRef.current = pendingConfirm;
+  // Esc 防抖：裸 \x1B 可能是箭头键的前缀，等一小段时间看是否有后续字节
+  const escTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── 任务池暂停状态（TUI 的 p 键）──
+  const poolPausedRef = useRef(false);
+  const [poolPaused, setPoolPaused] = useState(false);
+
+  // 注册确认响应方（TTY 专属；非 TTY 由 index.tsx 注册，单槽替换）。
+  // 声明在 run-start effect 之前，保证确认不会"未接线"。
+  useEffect(() => {
+    if (!isTty) return;
+    const showNext = () => {
+      const q = confirmQueueRef.current;
+      setPendingConfirm(q.length > 0 ? q[0] : null);
+      setConfirmScroll(0);
+    };
+    registerConfirmResponder((id, message) => {
+      confirmQueueRef.current.push({ id, message });
+      showNext();
+    });
+    return () => unregisterConfirmResponder();
+  }, [isTty]);
+
   // 键盘交互（仅执行态需要）—— 只在 phase / isTty 变化时重订阅
   useEffect(() => {
     if (phase !== 'running') return;
@@ -85,6 +125,51 @@ export function App({
 
     const onData = (data: Buffer) => {
       const s = data.toString();
+
+      // ── 确认态拦截：Enter=批准，n/x=拒绝，Esc=拒绝（50ms 防抖区分箭头键）──
+      const curConfirm = pendingConfirmRef.current;
+      if (curConfirm) {
+        const resolveNext = (ok: boolean) => {
+          if (escTimerRef.current) {
+            clearTimeout(escTimerRef.current);
+            escTimerRef.current = null;
+          }
+          const next = confirmQueueRef.current.shift();
+          if (next) respondConfirm(next.id, ok);
+          const q = confirmQueueRef.current;
+          setPendingConfirm(q.length > 0 ? q[0] : null);
+          setConfirmScroll(0);
+        };
+
+        if (s === '\r' || s === '\n') {
+          resolveNext(true);
+          return;
+        }
+        if (s === 'n' || s === 'x') {
+          resolveNext(false);
+          return;
+        }
+        if (s === '\x1B') {
+          // 裸 Esc：等 50ms 看是否有后续字节；有则取消（箭头键序列）
+          if (escTimerRef.current) clearTimeout(escTimerRef.current);
+          escTimerRef.current = setTimeout(() => {
+            escTimerRef.current = null;
+            resolveNext(false);
+          }, 50);
+          return;
+        }
+        if (s.startsWith('\x1B[')) {
+          // 箭头键/其他转义序列：取消 Esc 防抖并忽略
+          if (escTimerRef.current) {
+            clearTimeout(escTimerRef.current);
+            escTimerRef.current = null;
+          }
+          return;
+        }
+        // 确认态下其他按键忽略（q 也被吞掉，必须先解决确认）
+        return;
+      }
+
       // q / Ctrl+C 退出
       if (s === 'q' || s === '\x03') {
         exit();
@@ -96,11 +181,28 @@ export function App({
       const wheelMatch = s.match(/^\x1B\[<(\d+);(\d+);(\d+)M/);
       if (wheelMatch) {
         const btn = parseInt(wheelMatch[1], 10);
-        if (btn === 64) {
+        if (pendingConfirmRef.current) {
+          // 确认态：滚确认弹窗
+          setConfirmScroll((i) => (btn === 64 ? Math.max(0, i - 3) : i + 3));
+        } else if (btn === 64) {
           setDetailScroll((i) => Math.max(0, i - 3));
         } else if (btn === 65) {
           setDetailScroll((i) => i + 3);
         }
+        return;
+      }
+
+      // 取消选中的运行中任务 / 暂停-恢复任务池（确认态已被上面的拦截吞掉，不会误触）
+      if (s === 'c') {
+        const t = allTasksRef.current[selectedIdxRef.current];
+        if (t && t.ok === undefined) loopPool.cancelTask(t.taskId);
+        return;
+      }
+      if (s === 'p') {
+        const next = !poolPausedRef.current;
+        poolPausedRef.current = next;
+        setPoolPaused(next);
+        next ? loopPool.pausePool() : loopPool.resumePool();
         return;
       }
 
@@ -132,20 +234,26 @@ export function App({
     };
   }, [phase, isTty, isRawModeSupported, exit]);
 
-  // 启动 LoopPool
+  // 启动 LoopPool（全新 run 或断点恢复）
   useEffect(() => {
     if (phase !== 'running' || !request) return;
-    loopPool
-      .execute(request)
+    const promise = resumeRequestId
+      ? loopPool.resume(resumeRequestId)
+      : loopPool.execute(request);
+    promise
       .then((result) => {
         if (result?.result) printFinalResult(result.result);
         onDoneRef.current?.();
       })
       .catch((err) => {
-        logError('运行错误', err);
+        if (err instanceof PlanRejectedError) {
+          logError('计划已拒绝', err);
+        } else {
+          logError('运行错误', err);
+        }
         onDoneRef.current?.();
       });
-  }, [phase, request, loopPool]);
+  }, [phase, request, loopPool, resumeRequestId]);
 
   const cols = stdout.columns || 80;
   const rows = stdout.rows || 24;
@@ -199,6 +307,19 @@ export function App({
   // ───────── 执行态 ─────────
   const selectedTask = allTasks[selectedIdx];
   const finished = !!localState.finalSummary;
+
+  // 确认弹窗：整屏替换主界面（确认期间 run 被 requestConfirm 阻塞，无任务事件涌入，安全）
+  if (isTty && pendingConfirm) {
+    return (
+      <ConfirmModal
+        message={pendingConfirm.message}
+        width={cols}
+        height={rows}
+        scroll={confirmScroll}
+        queued={confirmQueueRef.current.length}
+      />
+    );
+  }
 
   // 非 TTY 降级：单栏流式
   if (!isTty) {
@@ -273,6 +394,7 @@ export function App({
         iteration={localState.iterations[localState.iterations.length - 1]?.iteration}
         maxIterations={localState.iterations[localState.iterations.length - 1]?.maxIterations}
         score={localState.iterations[localState.iterations.length - 1]?.decision?.qualityScore ?? localState.finalSummary?.qualityScore}
+        paused={poolPaused}
       />
     </Box>
   );

@@ -1,5 +1,5 @@
 import { Task, ExecutionResult } from '../types';
-import { ModelRegistry } from '../execution/model-registry';
+import { ModelRegistry, ResolvedModel } from '../execution/model-registry';
 import { AgentEngine } from '../execution/agent-engine';
 
 /**
@@ -20,13 +20,25 @@ export class TaskExecutor {
   private resultCache: Map<string, ExecutionResult> = new Map();
   /** 记录每个 task 的 workdir，validate 任务可复用被验收任务的 workdir */
   private workdirCache: Map<string, string> = new Map();
+  /** 上下文压缩用的摘要模型（config.system.contextSummarizer）；缺省 undefined → 复用任务模型 */
+  private summarizerModel: ResolvedModel | undefined;
 
-  constructor(registry: ModelRegistry, timeoutDefault: number = 1800000) {
+  constructor(
+    registry: ModelRegistry,
+    timeoutDefault: number = 1800000,
+    opts: { dangerousShell?: 'ask' | 'deny' | 'allow'; contextSummarizer?: string } = {}
+  ) {
     this.registry = registry;
-    this.engine = new AgentEngine({ timeoutDefault });
+    this.summarizerModel = opts.contextSummarizer
+      ? registry.resolve(opts.contextSummarizer)
+      : undefined;
+    this.engine = new AgentEngine({
+      timeoutDefault,
+      dangerousShell: opts.dangerousShell,
+    });
   }
 
-  async execute(task: Task): Promise<ExecutionResult> {
+  async execute(task: Task, signal?: AbortSignal): Promise<ExecutionResult> {
     const preparedTask = this.prepareTask(task);
     const model = this.registry.resolve(preparedTask.model);
 
@@ -40,7 +52,12 @@ export class TaskExecutor {
       prompt: workdirLine + preparedTask.prompt,
     };
 
-    const result = await this.engine.run(injectedTask, model);
+    const result = await this.engine.run(
+      injectedTask,
+      model,
+      signal,
+      this.summarizerModel
+    );
 
     this.resultCache.set(task.id, result);
     // 记录 workdir，供 validate 任务复用
@@ -85,6 +102,16 @@ export class TaskExecutor {
 
   getTaskResult(taskId: string): ExecutionResult | undefined {
     return this.resultCache.get(taskId);
+  }
+
+  /**
+   * 从持久化的检查点回灌结果缓存（resume 场景）。
+   * 恢复后的 validate 任务要能查到崩溃前的 targetTaskId，否则 prepareTask 会抛"找不到目标任务"。
+   */
+  seedResults(results: Map<string, ExecutionResult>): void {
+    for (const [id, result] of results) {
+      this.resultCache.set(id, result);
+    }
   }
 
   clearCache(): void {

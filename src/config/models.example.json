@@ -13,21 +13,30 @@
       "tier": "high",
       "provider": "claude",
       "modelId": "claude-opus-4-8",
-      "concurrent": true
+      "concurrent": true,
+      "maxContextTokens": 200000,
+      "priceIn1M": 15,
+      "priceOut1M": 75
     },
     {
       "id": "sonnet",
       "tier": "medium",
       "provider": "claude",
       "modelId": "claude-sonnet-4-6",
-      "concurrent": true
+      "concurrent": true,
+      "maxContextTokens": 200000,
+      "priceIn1M": 3,
+      "priceOut1M": 15
     },
     {
       "id": "local-qwen",
       "tier": "low",
       "provider": "gateway",
       "modelId": "qwen2.5-coder:7b",
-      "concurrent": false
+      "concurrent": false,
+      "maxContextTokens": 128000,
+      "priceIn1M": 0,
+      "priceOut1M": 0
     }
   ],
 

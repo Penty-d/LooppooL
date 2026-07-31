@@ -78,6 +78,12 @@ export interface ExecutionResult {
     endTime: Date;
     duration: number;
     tokensUsed?: number;
+    /** 本次调用消耗的 input token 数（成本核算用） */
+    inputTokens?: number;
+    /** 本次调用消耗的 output token 数（成本核算用） */
+    outputTokens?: number;
+    /** 估算成本（USD），由模型的 priceIn1k/priceOut1k 与 token 用量算出；未配价格时缺省 */
+    costUSD?: number;
     /** 实际请求 API 时使用的底层模型名 */
     modelUsed: string;
     /** 调度器挑中的模型条目 id（对应 ModelEntry.id） */
@@ -181,6 +187,19 @@ export interface ModelEntry {
   concurrent?: boolean;
   /** 可选的一句话说明，写进给调度器的清单，帮助它挑选 */
   note?: string;
+  /**
+   * 该模型的 context window（token 上限）。
+   * AgentEngine 用它作为该任务的上下文压缩阈值（缺省 200_000）。
+   * 128k 上下文的模型（如 DeepSeek）必须填，否则会在压缩生效前被服务端拒绝。
+   */
+  maxContextTokens?: number;
+  /**
+   * 每百万 input token 成本（USD），用于 run 结束的成本估算。
+   * 与各模型定价页单位一致（如 Claude Opus ≈ 15，DeepSeek ≈ 0.27）；缺省不计费。
+   */
+  priceIn1M?: number;
+  /** 每百万 output token 成本（USD）；缺省不计费 */
+  priceOut1M?: number;
 }
 
 /**
@@ -217,11 +236,30 @@ export interface ModelsConfig {
 
 // ============ 系统配置（config.json） ============
 
+/** 计划审批模式：none=不审批（默认），initial=只审批首个计划，always=每轮都审批 */
+export type ApprovalMode = 'none' | 'initial' | 'always';
+
+/** 危险 shell 命令管控：ask=询问确认，deny=直接拒绝，allow=不检查（legacy） */
+export type DangerousShellMode = 'ask' | 'deny' | 'allow';
+
 export interface SystemConfig {
   maxIterations: number;
   taskTimeout: number;
   globalParallelLimit: number;
   validationThreshold: number;
+  /**
+   * 失败任务自动重试次数（指数退避 1s/2s/4s…）。
+   * retryable:false 的任务不重试；缺省 0（不重试，保持旧行为）。
+   */
+  taskRetries: number;
+  /** 计划审批模式，见 ApprovalMode */
+  approvalMode: ApprovalMode;
+  /** 危险 shell 命令管控模式，见 DangerousShellMode */
+  dangerousShell: DangerousShellMode;
+  /** 单次 run 成本预算（USD）；0 = 不限制。超预算强制停止迭代 */
+  budgetUSD?: number;
+  /** 上下文压缩时用的摘要模型条目 id；缺省复用任务自身模型 */
+  contextSummarizer?: string;
 }
 
 export interface Config {
@@ -234,5 +272,7 @@ export interface Config {
   storage: {
     persistHistory: boolean;
     historyPath: string;
+    /** 项目运行日志 key（--project 覆盖）；空则禁用跨 run 日志 */
+    projectKey?: string;
   };
 }
