@@ -51,6 +51,13 @@ export interface LogEvent {
   ts: number;
 }
 
+/** 人工确认请求（计划审批 / 危险命令确认）。响应走 confirm.ts 的 respondConfirm，不经过事件总线。 */
+export interface UserConfirmEvent {
+  id: string;
+  message: string;
+  ts: number;
+}
+
 export interface IterationStartEvent {
   iteration: number;
   maxIterations: number;
@@ -142,7 +149,8 @@ export type UiEvent =
   | { type: 'decision'; payload: DecisionEvent }
   | { type: 'final-summary'; payload: FinalSummaryEvent }
   | { type: 'final-result'; payload: FinalResultEvent }
-  | { type: 'log'; payload: LogEvent };
+  | { type: 'log'; payload: LogEvent }
+  | { type: 'user-confirm'; payload: UserConfirmEvent };
 
 class UiEventBus extends EventEmitter {
   emit(type: UiEvent['type'], payload: any): boolean {

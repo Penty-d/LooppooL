@@ -21,9 +21,16 @@ export class TaskExecutor {
   /** 记录每个 task 的 workdir，validate 任务可复用被验收任务的 workdir */
   private workdirCache: Map<string, string> = new Map();
 
-  constructor(registry: ModelRegistry, timeoutDefault: number = 1800000) {
+  constructor(
+    registry: ModelRegistry,
+    timeoutDefault: number = 1800000,
+    opts: { dangerousShell?: 'ask' | 'deny' | 'allow' } = {}
+  ) {
     this.registry = registry;
-    this.engine = new AgentEngine({ timeoutDefault });
+    this.engine = new AgentEngine({
+      timeoutDefault,
+      dangerousShell: opts.dangerousShell,
+    });
   }
 
   async execute(task: Task): Promise<ExecutionResult> {

@@ -236,11 +236,26 @@ export interface ModelsConfig {
 
 // ============ 系统配置（config.json） ============
 
+/** 计划审批模式：none=不审批（默认），initial=只审批首个计划，always=每轮都审批 */
+export type ApprovalMode = 'none' | 'initial' | 'always';
+
+/** 危险 shell 命令管控：ask=询问确认，deny=直接拒绝，allow=不检查（legacy） */
+export type DangerousShellMode = 'ask' | 'deny' | 'allow';
+
 export interface SystemConfig {
   maxIterations: number;
   taskTimeout: number;
   globalParallelLimit: number;
   validationThreshold: number;
+  /**
+   * 失败任务自动重试次数（指数退避 1s/2s/4s…）。
+   * retryable:false 的任务不重试；缺省 0（不重试，保持旧行为）。
+   */
+  taskRetries: number;
+  /** 计划审批模式，见 ApprovalMode */
+  approvalMode: ApprovalMode;
+  /** 危险 shell 命令管控模式，见 DangerousShellMode */
+  dangerousShell: DangerousShellMode;
 }
 
 export interface Config {

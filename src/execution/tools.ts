@@ -11,6 +11,8 @@ import {
 import { resolve as pathResolve, relative, dirname, basename, isAbsolute } from 'path';
 import { glob as globCb } from 'glob';
 import { realpathSync } from 'fs';
+import { isDangerousCommand } from './dangerous';
+import { requestConfirm } from '../confirm';
 
 const execAsync = promisify(exec);
 
@@ -21,6 +23,8 @@ export interface ToolContext {
   workspace: string;
   bashTimeout?: number;
   maxOutputBytes?: number;
+  /** 危险 shell 命令管控：ask=询问确认，deny=直接拒绝，allow=不检查（缺省 ask） */
+  dangerousShell?: 'ask' | 'deny' | 'allow';
 }
 
 const DEFAULT_BASH_TIMEOUT = 60_000;
@@ -186,6 +190,28 @@ export function createTools(ctx: ToolContext) {
           throw new Error(`bash 参数无效：期望 { command: string }，收到 ${JSON.stringify(input).slice(0, 200)}`);
         }
         const targetCwd = cwd ? safePath(ctx, cwd) : ctx.workspace;
+
+        // 危险命令管控：系统破坏性命令（格式化/关机/删系统目录/dd 直写块设备等）拦截或人工确认
+        const dgMode = ctx.dangerousShell ?? 'ask';
+        if (dgMode !== 'allow') {
+          const hit = isDangerousCommand(command);
+          if (hit.dangerous) {
+            const refusal =
+              `[COMMAND_DENIED] 该命令命中危险命令管控，已拒绝执行。\n` +
+              `  命令：${command}\n` +
+              `  命中规则：${hit.pattern?.label ?? '未知'}（${hit.pattern?.id ?? '?'}）\n` +
+              `  系统配置 dangerousShell=${dgMode}。\n` +
+              `请改用安全的替代方案；若任务确实需要此系统级操作，请在最终回复里说明并停止，不要尝试绕过或换写法规避。`;
+            if (dgMode === 'deny') return refusal;
+            // 'ask' → 共享确认原语；无响应方 / 超时 → 拒绝
+            const ok = await requestConfirm(
+              `命令可能危险: ${command}\n命中规则: ${hit.pattern?.label ?? '未知'}\n批准执行？`,
+              { timeoutMs: 300_000 }
+            );
+            if (!ok) return refusal;
+          }
+        }
+
         try {
           const { stdout, stderr } = await execAsync(command, {
             cwd: targetCwd,

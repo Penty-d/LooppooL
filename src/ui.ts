@@ -141,6 +141,24 @@ export function logTaskError(taskId: string, msg: string): void {
   });
 }
 
+/** 任务失败重试告警（第 attempt/maxAttempts 次失败后 delayMs 再试） */
+export function logTaskRetry(
+  taskId: string,
+  error: string,
+  attempt: number,
+  maxAttempts: number,
+  delayMs: number
+): void {
+  bus.dispatch({
+    type: 'log',
+    payload: {
+      level: 'warn',
+      message: `[${taskId}] 第 ${attempt}/${maxAttempts} 次尝试失败（${error}），${delayMs}ms 后重试`,
+      ts: now(),
+    },
+  });
+}
+
 export function logStageSummary(success: number, total: number): void {
   // 注意：原 API 没传 stageId，这里用一个占位 id，TUI 用最近一个 stage 关联
   bus.dispatch({

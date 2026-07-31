@@ -3,7 +3,10 @@
     "maxIterations": 20,
     "taskTimeout": 1800000,
     "globalParallelLimit": 10,
-    "validationThreshold": 80
+    "validationThreshold": 80,
+    "taskRetries": 1,
+    "approvalMode": "none",
+    "dangerousShell": "ask"
   },
   "logging": {
     "level": "info",

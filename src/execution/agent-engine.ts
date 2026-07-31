@@ -21,6 +21,7 @@ export class AgentEngine {
   private maxSteps: number;
   private timeoutDefault: number;
   private maxInputTokens: number;
+  private dangerousShell: 'ask' | 'deny' | 'allow';
 
   constructor(opts: {
     workspace?: string;
@@ -34,12 +35,15 @@ export class AgentEngine {
      * 那时请显式调小这个值。
      */
     maxInputTokens?: number;
+    /** 危险 shell 命令管控模式（透传给 createTools） */
+    dangerousShell?: 'ask' | 'deny' | 'allow';
   } = {}) {
     // 缺省给所有任务一个共享 workspace；调用方也可在 task.input.workspace 覆盖
     this.workspace = pathResolve(opts.workspace ?? './.looppool-workspace');
     this.maxSteps = opts.maxSteps ?? 30;
     this.timeoutDefault = opts.timeoutDefault ?? 1_800_000;
     this.maxInputTokens = opts.maxInputTokens ?? 200_000;
+    this.dangerousShell = opts.dangerousShell ?? 'ask';
     mkdirSync(this.workspace, { recursive: true });
   }
 
@@ -62,7 +66,10 @@ export class AgentEngine {
 
     try {
       const provider = this.buildProvider(model);
-      const tools = createTools({ workspace: taskWorkspace });
+      const tools = createTools({
+        workspace: taskWorkspace,
+        dangerousShell: this.dangerousShell,
+      });
 
       // 上下文压缩预算：按任务模型的实际 context window 定，缺省回退引擎默认。
       // 乘 0.9 留安全余量——估算只覆盖 messages，不含 system prompt / 工具 schema / 输出预留。

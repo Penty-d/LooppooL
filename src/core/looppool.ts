@@ -6,6 +6,7 @@ import {
   IterationRecord,
   Config,
   ModelsConfig,
+  ApprovalMode,
 } from '../types';
 import { TaskExecutor } from '../agents';
 import { ModelRegistry } from '../execution/model-registry';
@@ -13,6 +14,8 @@ import { AnthropicClient } from '../llm';
 import { Orchestrator } from './orchestrator';
 import { TaskPool } from './task-pool';
 import { CheckpointStore, CheckpointStatus } from '../storage';
+import { requestConfirm } from '../confirm';
+import { PlanRejectedError } from '../errors';
 import {
   logIteration,
   logError,
@@ -26,12 +29,19 @@ import {
   logDecision,
 } from '../ui';
 
+/** LoopPool 构造选项（CLI 覆盖用） */
+export interface LoopPoolOptions {
+  /** 计划审批模式覆盖（--approve/--no-approve）；优先于 config */
+  approvalMode?: ApprovalMode;
+}
+
 export class LoopPool {
   private config: Config;
   private models: ModelsConfig;
   private orchestrator: Orchestrator;
   private taskPool: TaskPool;
   private executor: TaskExecutor;
+  private approvalMode: ApprovalMode;
 
   /**
    * 检查点存储：config.storage.persistHistory=false 时为 null（不落盘、不可恢复）。
@@ -39,7 +49,7 @@ export class LoopPool {
    */
   public readonly checkpointStore: CheckpointStore | null;
 
-  constructor(config: Config, models: ModelsConfig) {
+  constructor(config: Config, models: ModelsConfig, options: LoopPoolOptions = {}) {
     this.config = config;
     this.models = models;
 
@@ -47,14 +57,24 @@ export class LoopPool {
     const registry = new ModelRegistry(models);
 
     // 执行器：所有 execute/validate 任务走 AgentEngine（Vercel AI SDK + 工具集）
-    this.executor = new TaskExecutor(registry, config.system.taskTimeout);
+    this.executor = new TaskExecutor(registry, config.system.taskTimeout, {
+      dangerousShell: config.system.dangerousShell,
+    });
 
     // 调度器：直连 Anthropic 协议端点（手写 fetch），返回结构化 JSON
     const client = new AnthropicClient(models.orchestrator);
     this.orchestrator = new Orchestrator(client, registry);
 
-    // 任务池：按模型并发能力调度并行/串行
-    this.taskPool = new TaskPool(this.executor, registry, config.system.globalParallelLimit);
+    // 任务池：按模型并发能力调度并行/串行，失败任务自动重试 taskRetries 次
+    this.taskPool = new TaskPool(
+      this.executor,
+      registry,
+      config.system.globalParallelLimit,
+      config.system.taskRetries
+    );
+
+    // 计划审批模式：CLI 覆盖 > config > 默认 none
+    this.approvalMode = options.approvalMode ?? config.system.approvalMode ?? 'none';
 
     // 断点持久化：尊重 persistHistory 开关
     this.checkpointStore = config.storage.persistHistory
@@ -163,6 +183,12 @@ export class LoopPool {
           );
         }
 
+        // 计划审批：按模式在计划产出后、执行前征询用户（否决 → PlanRejectedError 中止）
+        if (this.shouldRequestApproval(iteration)) {
+          const approved = await this.askApproval(plan, context, iteration);
+          if (!approved) throw new PlanRejectedError();
+        }
+
         // 2. 执行计划
         const results = await this.taskPool.executePlan(plan);
 
@@ -223,6 +249,8 @@ export class LoopPool {
         }
 
       } catch (error) {
+        // 用户否决：立即中止，不得计入失败/触发重规划重问
+        if (error instanceof PlanRejectedError) throw error;
         consecutiveFailures++;
         logError(`迭代 ${iteration}`, error);
 
@@ -276,6 +304,59 @@ export class LoopPool {
     } catch (error) {
       logError('检查点落盘失败', error);
     }
+  }
+
+  /**
+   * 是否需要对本次迭代的计划做审批
+   * resume 后 iteration 从 history.length+1 起，'initial' 不重复问（原 run 的首计划已批过）。
+   */
+  private shouldRequestApproval(iteration: number): boolean {
+    return (
+      this.approvalMode === 'always' ||
+      (this.approvalMode === 'initial' && iteration === 1)
+    );
+  }
+
+  /** 生成计划摘要并请求人工确认 */
+  private async askApproval(
+    plan: ExecutionPlan,
+    context: Context,
+    iteration: number
+  ): Promise<boolean> {
+    return requestConfirm(this.buildPlanSummary(plan, context, iteration));
+  }
+
+  /** 把计划压成紧凑文本给确认弹窗展示 */
+  private buildPlanSummary(
+    plan: ExecutionPlan,
+    context: Context,
+    iteration: number
+  ): string {
+    const total = plan.stages.reduce((s, st) => s + st.tasks.length, 0);
+    const lines: string[] = [
+      `计划审批 — 迭代 ${iteration}/${this.config.system.maxIterations}`,
+      '',
+      `【用户需求】${this.truncate(context.userRequest, 200)}`,
+    ];
+    if (plan.reasoning) {
+      lines.push(`【规划思路】${this.truncate(plan.reasoning, 400)}`);
+    }
+    lines.push(`【任务清单】共 ${total} 个任务`);
+    plan.stages.forEach((st, i) => {
+      lines.push(`  Stage ${i + 1} [${st.mode}]`);
+      st.tasks.forEach((t) => {
+        lines.push(`    - ${t.id} [${t.kind}/${t.model}] ${t.description}`);
+        lines.push(`        ${this.truncate(t.prompt.replace(/\s+/g, ' ').trim(), 120)}`);
+      });
+    });
+    lines.push('');
+    lines.push('批准后将立即开始执行此计划（Enter 批准 / Esc 拒绝）。');
+    return lines.join('\n');
+  }
+
+  private truncate(s: string, max: number): string {
+    if (s.length <= max) return s;
+    return s.slice(0, Math.max(0, max - 1)) + '…';
   }
 
   /**

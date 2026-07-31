@@ -8,6 +8,7 @@ import {
   logTaskError,
   logStageSummary,
   logCriticalAbort,
+  logTaskRetry,
 } from '../ui';
 
 /**
@@ -28,15 +29,18 @@ export class TaskPool {
   private executor: TaskExecutor;
   private registry: ModelRegistry;
   private globalParallelLimit: number;
+  private taskRetries: number;
 
   constructor(
     executor: TaskExecutor,
     registry: ModelRegistry,
-    globalParallelLimit: number = 10
+    globalParallelLimit: number = 10,
+    taskRetries: number = 1
   ) {
     this.executor = executor;
     this.registry = registry;
     this.globalParallelLimit = globalParallelLimit;
+    this.taskRetries = taskRetries;
   }
 
   /** 执行完整的执行计划 */
@@ -111,7 +115,7 @@ export class TaskPool {
           running++;
           perModelRunning.set(key, inFlight + 1);
 
-          this.executeTaskWithLogging(task)
+          this.executeTaskWithRetries(task)
             .then((result) => {
               results.set(task.id, result);
             })
@@ -137,10 +141,11 @@ export class TaskPool {
     const results = new Map<string, ExecutionResult>();
 
     for (const task of tasks) {
-      const result = await this.executeTaskWithLogging(task);
+      const result = await this.executeTaskWithRetries(task);
       results.set(task.id, result);
 
-      if (result.status === 'failed' && !task.retryable) {
+      // 最终尝试仍失败 → 断链（后续任务有依赖，继续无意义）
+      if (result.status === 'failed') {
         break;
       }
     }
@@ -180,6 +185,27 @@ export class TaskPool {
       logTaskError(task.id, msg);
       return this.toFailure(task, error);
     }
+  }
+
+  /**
+   * 执行任务并带失败重试（指数退避 1s/2s/4s…）。
+   * retryable === false → 只尝试一次（显式不重试）；否则最多 1 + taskRetries 次。
+   */
+  private async executeTaskWithRetries(task: Task): Promise<ExecutionResult> {
+    const maxAttempts = task.retryable === false ? 1 : 1 + this.taskRetries;
+    let result: ExecutionResult | undefined;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      result = await this.executeTaskWithLogging(task);
+      if (result.status !== 'failed' || attempt === maxAttempts) {
+        return result;
+      }
+      const delayMs = 1000 * 2 ** (attempt - 1); // 1s, 2s, 4s...
+      logTaskRetry(task.id, result.error ?? '未知错误', attempt, maxAttempts, delayMs);
+      await new Promise((r) => setTimeout(r, delayMs));
+    }
+
+    return result!;
   }
 
   private toFailure(task: Task, error: unknown): ExecutionResult {

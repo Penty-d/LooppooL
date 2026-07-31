@@ -1,9 +1,12 @@
 import React from 'react';
 import { render } from 'ink';
+import { createInterface } from 'readline';
 import { LoopPool } from './core';
 import { loadConfig, loadModelsConfig } from './config';
 import { printFinalResult, logError } from './ui';
 import { App } from './tui/App';
+import { registerConfirmResponder, respondConfirm } from './confirm';
+import type { ApprovalMode } from './types';
 
 /**
  * 终端控制序列
@@ -55,7 +58,23 @@ export async function main() {
   try {
     const config = loadConfig();
     const models = loadModelsConfig();
-    const loopPool = new LoopPool(config, models);
+
+    // 解析 argv：--resume [requestId] / --approve / --no-approve / 需求
+    const argv = process.argv.slice(2);
+    const resumeIdx = argv.indexOf('--resume');
+    const resuming = resumeIdx !== -1;
+
+    // 计划审批覆盖：--approve=initial / --no-approve=none，后出现者优先（都出现时 --no-approve 更安全）
+    const approveIdx = argv.indexOf('--approve');
+    const noApproveIdx = argv.indexOf('--no-approve');
+    let approvalOverride: ApprovalMode | undefined;
+    if (noApproveIdx !== -1 && (approveIdx === -1 || noApproveIdx > approveIdx)) {
+      approvalOverride = 'none';
+    } else if (approveIdx !== -1) {
+      approvalOverride = 'initial';
+    }
+
+    const loopPool = new LoopPool(config, models, { approvalMode: approvalOverride });
 
     const isTty = process.stdin.isTTY === true;
 
@@ -68,10 +87,25 @@ export async function main() {
       process.on('SIGTERM', () => { restore(); process.exit(0); });
     }
 
-    // 解析 argv：--resume [requestId] 走恢复路径；否则 argv[0] 是需求
-    const argv = process.argv.slice(2);
-    const resumeIdx = argv.indexOf('--resume');
-    const resuming = resumeIdx !== -1;
+    // 非 TTY：注册确认响应方（打印消息 + 读一行 y/n；EOF → 拒绝）。
+    // 注意：请求从管道 echo "..." | npm run dev 来时 stdin 已被 readStdin() 消费到 EOF，
+    // 确认会立即自动拒绝——非交互自动化请配 approvalMode:none / dangerousShell:deny|allow 或 --no-approve。
+    if (!isTty) {
+      registerConfirmResponder((id, message) => {
+        process.stderr.write(`\n[需要确认] ${message}\n(y/n): `);
+        const rl = createInterface({ input: process.stdin, terminal: false });
+        let settled = false;
+        const done = (ok: boolean) => {
+          if (settled) return;
+          settled = true;
+          rl.close();
+          respondConfirm(id, ok);
+        };
+        rl.once('line', (line) => done(/^y(?:es)?$/i.test(line.trim())));
+        rl.once('close', () => done(false)); // EOF → 拒绝
+        rl.once('error', () => done(false));
+      });
+    }
 
     let initialRequest = '';
     let resumeRequestId: string | null = null;
