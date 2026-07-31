@@ -1,15 +1,29 @@
-import { Context, Decision, ExecutionPlan, Config, ModelsConfig } from '../types';
+import {
+  Context,
+  Decision,
+  ExecutionPlan,
+  ExecutionResult,
+  IterationRecord,
+  Config,
+  ModelsConfig,
+} from '../types';
 import { TaskExecutor } from '../agents';
 import { ModelRegistry } from '../execution/model-registry';
 import { AnthropicClient } from '../llm';
 import { Orchestrator } from './orchestrator';
 import { TaskPool } from './task-pool';
+import { CheckpointStore, CheckpointStatus } from '../storage';
 import {
   logIteration,
   logError,
   printFinalSummary,
   logPlanReady,
   logReasoning,
+  logStage,
+  logTaskStart,
+  logTaskDone,
+  logStageSummary,
+  logDecision,
 } from '../ui';
 
 export class LoopPool {
@@ -17,6 +31,13 @@ export class LoopPool {
   private models: ModelsConfig;
   private orchestrator: Orchestrator;
   private taskPool: TaskPool;
+  private executor: TaskExecutor;
+
+  /**
+   * 检查点存储：config.storage.persistHistory=false 时为 null（不落盘、不可恢复）。
+   * resume() 与 CLI 的 --resume 依赖它。
+   */
+  public readonly checkpointStore: CheckpointStore | null;
 
   constructor(config: Config, models: ModelsConfig) {
     this.config = config;
@@ -26,39 +47,99 @@ export class LoopPool {
     const registry = new ModelRegistry(models);
 
     // 执行器：所有 execute/validate 任务走 AgentEngine（Vercel AI SDK + 工具集）
-    const executor = new TaskExecutor(registry, config.system.taskTimeout);
+    this.executor = new TaskExecutor(registry, config.system.taskTimeout);
 
     // 调度器：直连 Anthropic 协议端点（手写 fetch），返回结构化 JSON
     const client = new AnthropicClient(models.orchestrator);
     this.orchestrator = new Orchestrator(client, registry);
 
     // 任务池：按模型并发能力调度并行/串行
-    this.taskPool = new TaskPool(executor, registry, config.system.globalParallelLimit);
+    this.taskPool = new TaskPool(this.executor, registry, config.system.globalParallelLimit);
+
+    // 断点持久化：尊重 persistHistory 开关
+    this.checkpointStore = config.storage.persistHistory
+      ? new CheckpointStore(config.storage.historyPath)
+      : null;
   }
 
   /**
-   * 执行用户请求
+   * 执行用户请求（全新 run）
+   * @param requestId 可选，供 CLI/测试注入；缺省自动生成
    */
-  async execute(userRequest: string, userContext?: any): Promise<any> {
+  async execute(userRequest: string, userContext?: any, requestId?: string): Promise<any> {
     // 记录启动时间，用于最终结果的真实耗时统计（totalTime 由系统实测，而非 LLM 编造）
     const startedAt = Date.now();
 
     // 初始化上下文
     const context: Context = {
-      requestId: this.generateRequestId(),
+      requestId: requestId ?? this.generateRequestId(),
       userRequest,
       history: [],
       accumulatedResults: new Map(),
       userContext,
     };
 
-    let iteration = 0;
+    return this.runLoop({ context, startedAt, iteration: 0, pendingPlan: undefined });
+  }
+
+  /**
+   * 从断点恢复一个未完成的 run
+   */
+  async resume(requestId: string): Promise<any> {
+    if (!this.checkpointStore) {
+      throw new Error('config.storage.persistHistory=false，未持久化检查点，无法恢复');
+    }
+
+    const ckpt = this.checkpointStore.load(requestId);
+    if (!ckpt) {
+      throw new Error(`检查点不存在或已损坏: ${requestId}`);
+    }
+    if (ckpt.status === 'completed') {
+      throw new Error(`该任务已完成，无需恢复: ${requestId}`);
+    }
+
+    const context: Context = {
+      requestId: ckpt.requestId,
+      userRequest: ckpt.userRequest,
+      history: ckpt.history,
+      accumulatedResults: ckpt.accumulatedResults,
+      userContext: ckpt.userContext,
+    };
+
+    // 回灌结果缓存：恢复后的 validate 任务要能查到崩溃前的 targetTaskId
+    this.executor.seedResults(context.accumulatedResults);
+
+    // 先把历史迭代折叠重放到 TUI，再继续流式跑新迭代
+    this.replayHistory(context.history);
+
+    return this.runLoop({
+      context,
+      startedAt: ckpt.startedAt, // 沿用原 startedAt，totalTime 跨崩溃累计
+      iteration: context.history.length,
+      pendingPlan: ckpt.pendingPlan,
+    });
+  }
+
+  /**
+   * 主循环（fresh 与 resume 共用）
+   * @param iteration 已完成的迭代数（fresh=0，resume=history.length）；
+   *                  循环顶部 ++，故本轮迭代号 = iteration+1，
+   *                  正好对上 orchestrator 里 context.history.length + 1 的 dump key / prompt 计数
+   */
+  private async runLoop(opts: {
+    context: Context;
+    startedAt: number;
+    iteration: number;
+    pendingPlan?: ExecutionPlan;
+  }): Promise<any> {
+    const { context, startedAt } = opts;
+    let iteration = opts.iteration;
+    let pendingPlan = opts.pendingPlan;
+
     const maxIterations = this.config.system.maxIterations;
     // 连续失败熔断：连续 N 次迭代抛错即停止（说明存在稳定故障，重试不会变好）
     const MAX_CONSECUTIVE_FAILURES = 3;
     let consecutiveFailures = 0;
-    // 上一轮决策给出的 newPlan：第二轮起优先用，避免重复规划丢上下文
-    let pendingPlan: import('../types').ExecutionPlan | undefined;
 
     while (iteration < maxIterations) {
       iteration++;
@@ -108,6 +189,11 @@ export class LoopPool {
 
         // 4. 根据决策判断是否继续
         if (!decision.shouldContinue) {
+          this.checkpoint(context, {
+            pendingPlan: undefined,
+            startedAt,
+            status: 'completed',
+          });
           printFinalSummary({
             status: 'completed',
             iterations: iteration,
@@ -126,6 +212,16 @@ export class LoopPool {
         // 本轮完整成功，清零连续失败计数
         consecutiveFailures = 0;
 
+        // 5. 落盘检查点 —— 必须在 pendingPlan 赋值之后，否则下一轮计划存不下来
+        this.checkpoint(context, { pendingPlan, startedAt, status: 'in-progress' });
+
+        // [test] 崩溃模拟钩子：验证断点续跑（仅在该环境变量设置时触发）
+        const crashAt = Number(process.env.LOOPPOOL_CRASH_AT || 0);
+        if (crashAt && iteration === crashAt) {
+          console.error(`[test] 模拟第 ${iteration} 次迭代完成后崩溃`);
+          process.exit(1);
+        }
+
       } catch (error) {
         consecutiveFailures++;
         logError(`迭代 ${iteration}`, error);
@@ -142,7 +238,12 @@ export class LoopPool {
       }
     }
 
-    // 达到最大迭代次数
+    // 达到最大迭代次数（partial）——落盘 completed 供历史留档，不再可恢复
+    this.checkpoint(context, {
+      pendingPlan: undefined,
+      startedAt,
+      status: 'completed',
+    });
     printFinalSummary({
       status: 'partial',
       iterations: iteration,
@@ -151,6 +252,80 @@ export class LoopPool {
     });
 
     return this.formatPartialResult(context, startedAt);
+  }
+
+  /**
+   * 落盘检查点。写盘失败只告警、不中断执行（丢持久性但不丢进度）。
+   */
+  private checkpoint(
+    context: Context,
+    opts: { pendingPlan?: ExecutionPlan; startedAt: number; status?: CheckpointStatus }
+  ): void {
+    if (!this.checkpointStore) return;
+    try {
+      this.checkpointStore.save({
+        requestId: context.requestId,
+        userRequest: context.userRequest,
+        userContext: context.userContext,
+        startedAt: opts.startedAt,
+        pendingPlan: opts.pendingPlan,
+        accumulatedResults: context.accumulatedResults,
+        history: context.history,
+        status: opts.status ?? 'in-progress',
+      });
+    } catch (error) {
+      logError('检查点落盘失败', error);
+    }
+  }
+
+  /**
+   * 折叠重放历史迭代到 TUI（resume 启动时调用）。
+   * 只发迭代/阶段/任务/决策事件，不发 tool-call 等细节事件——
+   * 过去的迭代以"已完成"状态呈现，新迭代随后流式展示。
+   * 事件顺序与 state.ts reducer 对齐：
+   *   stage-start 设 currentStageId → task-start 落入正确 stage；
+   *   task-done 从后往前匹配最近一次同名任务。
+   */
+  private replayHistory(history: IterationRecord[]): void {
+    const maxIterations = this.config.system.maxIterations;
+
+    for (const rec of history) {
+      logIteration(rec.iteration, maxIterations);
+      logReasoning(rec.plan.reasoning);
+
+      const stageCount = rec.plan.stages.length;
+      rec.plan.stages.forEach((stage, i) => {
+        logStage(i + 1, stageCount, stage.id, stage.mode, stage.tasks.length);
+
+        for (const task of stage.tasks) {
+          logTaskStart(task.id, task.model, task.description, task.kind);
+          const result = rec.results.get(task.id);
+          if (result) {
+            logTaskDone(
+              task.id,
+              result.status === 'success',
+              result.metrics.duration,
+              result.metrics.modelUsed
+            );
+          }
+          // 无结果的任务（critical-failure 中止 / serial break 未执行）保持 ○ 未完成态
+        }
+
+        const stageResults = stage.tasks
+          .map((t) => rec.results.get(t.id))
+          .filter((r): r is ExecutionResult => !!r);
+        logStageSummary(
+          stageResults.filter((r) => r.status === 'success').length,
+          stageResults.length
+        );
+      });
+
+      logDecision(
+        rec.decision.shouldContinue,
+        rec.decision.qualityScore,
+        rec.decision.reason
+      );
+    }
   }
 
   /**

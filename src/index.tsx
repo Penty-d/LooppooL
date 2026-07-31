@@ -68,19 +68,56 @@ export async function main() {
       process.on('SIGTERM', () => { restore(); process.exit(0); });
     }
 
-    // 从命令行参数预填需求（可选）；非 TTY 且无参数时从 stdin 读（管道输入），
-    // 否则 App 会卡在输入态无法提交
-    let initialRequest = process.argv[2] || '';
-    if (!isTty && !initialRequest) {
-      initialRequest = await readStdin();
-      if (!initialRequest) {
+    // 解析 argv：--resume [requestId] 走恢复路径；否则 argv[0] 是需求
+    const argv = process.argv.slice(2);
+    const resumeIdx = argv.indexOf('--resume');
+    const resuming = resumeIdx !== -1;
+
+    let initialRequest = '';
+    let resumeRequestId: string | null = null;
+
+    if (resuming) {
+      if (!loopPool.checkpointStore) {
         logError(
           '启动错误',
-          new Error(
-            '非 TTY 模式必须提供需求：`npm run dev "需求"` 或 `echo "需求" | npm run dev`'
-          )
+          new Error('--resume 需要 config.storage.persistHistory=true')
         );
         process.exit(1);
+      }
+      const maybe = argv[resumeIdx + 1];
+      const explicitId = maybe && !maybe.startsWith('--') ? maybe : null;
+      // 无显式 id 时自动选最近一次可恢复的 run
+      const requestId =
+        explicitId ?? loopPool.checkpointStore.listResumable()[0]?.requestId;
+      if (!requestId) {
+        logError('启动错误', new Error('没有可恢复的检查点'));
+        process.exit(1);
+      }
+      const ckpt = loopPool.checkpointStore.load(requestId);
+      if (!ckpt) {
+        logError('启动错误', new Error(`检查点不存在或已损坏: ${requestId}`));
+        process.exit(1);
+      }
+      if (ckpt.status === 'completed') {
+        logError('启动错误', new Error(`任务已完成，无需恢复: ${requestId}`));
+        process.exit(1);
+      }
+      resumeRequestId = requestId;
+      initialRequest = ckpt.userRequest; // App 直接进 running 态，Header 显示原需求
+    } else {
+      initialRequest = argv[0] || '';
+      if (!isTty && !initialRequest) {
+        // 非 TTY：从管道 stdin 读需求，否则 App 会卡在输入态无法提交
+        initialRequest = await readStdin();
+        if (!initialRequest) {
+          logError(
+            '启动错误',
+            new Error(
+              '非 TTY 模式必须提供需求：`npm run dev "需求"` 或 `echo "需求" | npm run dev`'
+            )
+          );
+          process.exit(1);
+        }
       }
     }
 
@@ -91,6 +128,7 @@ export async function main() {
     const { unmount, waitUntilExit } = render(
       <App
         initialRequest={initialRequest}
+        resumeRequestId={resumeRequestId}
         loopPool={loopPool}
         isTty={isTty}
         onDone={() => {
@@ -129,4 +167,5 @@ export * from './types';
 export * from './core';
 export * from './agents';
 export * from './execution';
+export * from './storage';
 export { loadConfig, loadModelsConfig } from './config';

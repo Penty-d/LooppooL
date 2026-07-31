@@ -87,6 +87,16 @@ export class TaskExecutor {
     return this.resultCache.get(taskId);
   }
 
+  /**
+   * 从持久化的检查点回灌结果缓存（resume 场景）。
+   * 恢复后的 validate 任务要能查到崩溃前的 targetTaskId，否则 prepareTask 会抛"找不到目标任务"。
+   */
+  seedResults(results: Map<string, ExecutionResult>): void {
+    for (const [id, result] of results) {
+      this.resultCache.set(id, result);
+    }
+  }
+
   clearCache(): void {
     this.resultCache.clear();
   }

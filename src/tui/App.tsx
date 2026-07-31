@@ -21,11 +21,14 @@ type Phase = 'input' | 'running';
  */
 export function App({
   initialRequest,
+  resumeRequestId,
   loopPool,
   isTty,
   onDone,
 }: {
   initialRequest: string;
+  /** 非空表示本次是断点恢复：直接进 running 态并调用 loopPool.resume(id) */
+  resumeRequestId?: string | null;
   loopPool: LoopPool;
   isTty: boolean;
   onDone?: () => void;
@@ -132,11 +135,13 @@ export function App({
     };
   }, [phase, isTty, isRawModeSupported, exit]);
 
-  // 启动 LoopPool
+  // 启动 LoopPool（全新 run 或断点恢复）
   useEffect(() => {
     if (phase !== 'running' || !request) return;
-    loopPool
-      .execute(request)
+    const promise = resumeRequestId
+      ? loopPool.resume(resumeRequestId)
+      : loopPool.execute(request);
+    promise
       .then((result) => {
         if (result?.result) printFinalResult(result.result);
         onDoneRef.current?.();
@@ -145,7 +150,7 @@ export function App({
         logError('运行错误', err);
         onDoneRef.current?.();
       });
-  }, [phase, request, loopPool]);
+  }, [phase, request, loopPool, resumeRequestId]);
 
   const cols = stdout.columns || 80;
   const rows = stdout.rows || 24;
