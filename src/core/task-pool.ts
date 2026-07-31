@@ -78,11 +78,15 @@ export class TaskPool {
     const pending = [...tasks];
     const perModelRunning = new Map<string, number>(); // key: provider:modelId
     let running = 0;
+    // 已结束的任务数（含失败）。不能用 results.size 判断完成——
+    // 若调度器输出了重复 task id，results.set 会覆盖导致 size 永远小于 tasks.length，
+    // 完成条件永不满足 → Promise 永不 resolve → 进程挂死。
+    let completed = 0;
 
     return new Promise((resolve) => {
       const tryDispatch = () => {
-        // 全部完成
-        if (results.size === tasks.length && running === 0) {
+        // 全部完成（按已结束任务数判断，不受重复 id 影响）
+        if (completed === tasks.length && running === 0) {
           resolve(results);
           return;
         }
@@ -116,6 +120,7 @@ export class TaskPool {
             })
             .finally(() => {
               running--;
+              completed++;
               perModelRunning.set(key, (perModelRunning.get(key) || 1) - 1);
               tryDispatch();
             });

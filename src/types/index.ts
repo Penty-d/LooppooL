@@ -78,6 +78,12 @@ export interface ExecutionResult {
     endTime: Date;
     duration: number;
     tokensUsed?: number;
+    /** 本次调用消耗的 input token 数（成本核算用） */
+    inputTokens?: number;
+    /** 本次调用消耗的 output token 数（成本核算用） */
+    outputTokens?: number;
+    /** 估算成本（USD），由模型的 priceIn1k/priceOut1k 与 token 用量算出；未配价格时缺省 */
+    costUSD?: number;
     /** 实际请求 API 时使用的底层模型名 */
     modelUsed: string;
     /** 调度器挑中的模型条目 id（对应 ModelEntry.id） */
@@ -181,6 +187,19 @@ export interface ModelEntry {
   concurrent?: boolean;
   /** 可选的一句话说明，写进给调度器的清单，帮助它挑选 */
   note?: string;
+  /**
+   * 该模型的 context window（token 上限）。
+   * AgentEngine 用它作为该任务的上下文压缩阈值（缺省 200_000）。
+   * 128k 上下文的模型（如 DeepSeek）必须填，否则会在压缩生效前被服务端拒绝。
+   */
+  maxContextTokens?: number;
+  /**
+   * 每百万 input token 成本（USD），用于 run 结束的成本估算。
+   * 与各模型定价页单位一致（如 Claude Opus ≈ 15，DeepSeek ≈ 0.27）；缺省不计费。
+   */
+  priceIn1M?: number;
+  /** 每百万 output token 成本（USD）；缺省不计费 */
+  priceOut1M?: number;
 }
 
 /**

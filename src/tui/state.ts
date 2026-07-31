@@ -34,6 +34,9 @@ export interface TaskEventEntry {
   keptSteps?: number;
 }
 
+/** 单个 task 保留的最大事件数：超出丢弃最早的部分（长任务事件无上限会拖慢渲染） */
+export const MAX_TASK_EVENTS = 200;
+
 export interface TaskEntry {
   /** 全局唯一 key（iteration-stage-taskId），用于选中/展开区分，避免不同迭代同名 task 撞车 */
   uid: string;
@@ -47,6 +50,10 @@ export interface TaskEntry {
   durationMs?: number;
   modelUsed?: string;
   events: TaskEventEntry[];
+  /** 工具调用次数（O(1) 计数，避免每次渲染 filter 全量 events） */
+  toolCalls: number;
+  /** 因超过 MAX_TASK_EVENTS 被丢弃的早期事件数 */
+  truncatedEvents?: number;
   expanded: boolean;
 }
 
@@ -85,7 +92,7 @@ export interface TuiState {
   selectedTaskId?: string; // 当前展开/选中的 task
 }
 
-const initialState: TuiState = {
+export const initialState: TuiState = {
   bannerShown: false,
   iterations: [],
   logs: [],
@@ -94,7 +101,7 @@ const initialState: TuiState = {
 type Action =
   | { type: 'event'; event: UiEvent };
 
-function reducer(state: TuiState, action: Action): TuiState {
+export function reducer(state: TuiState, action: Action): TuiState {
   if (action.type !== 'event') return state;
   const e = action.event;
   const p = e.payload as any;
@@ -170,6 +177,7 @@ function reducer(state: TuiState, action: Action): TuiState {
                 kind: p.kind,
                 startedAt: p.ts,
                 events: [],
+                toolCalls: 0,
                 expanded: false,
               },
             ],
@@ -212,7 +220,20 @@ function reducer(state: TuiState, action: Action): TuiState {
           entry.afterTokens = p.afterTokens;
           entry.keptSteps = p.keptSteps;
         }
-        return { ...t, events: [...t.events, entry] };
+        // 事件封顶：只保留最近 MAX_TASK_EVENTS 条，丢弃最早的记入 truncatedEvents
+        let events = [...t.events, entry];
+        let truncated = t.truncatedEvents ?? 0;
+        if (events.length > MAX_TASK_EVENTS) {
+          const removed = events.length - MAX_TASK_EVENTS;
+          events = events.slice(removed);
+          truncated += removed;
+        }
+        return {
+          ...t,
+          events,
+          truncatedEvents: truncated || undefined,
+          toolCalls: t.toolCalls + (e.type === 'tool-call' ? 1 : 0),
+        };
       });
       return { ...state, iterations };
     }
@@ -288,13 +309,27 @@ function updateTask(
   taskId: string,
   fn: (t: TaskEntry) => TaskEntry
 ): IterationEntry[] {
-  return iterations.map((it) => ({
-    ...it,
-    stages: it.stages.map((st) => ({
-      ...st,
-      tasks: st.tasks.map((t) => (t.taskId === taskId ? fn(t) : t)),
-    })),
-  }));
+  // 事件只携带 taskId，但不同迭代会复用同名 taskId（"task-1"、"task-2"...）。
+  // 迭代严格串行执行，事件必然属于「最新一次」出现的该 task——
+  // 所以只更新最后一个匹配项，避免上一轮已完成任务的 events/状态被下一轮事件污染。
+  for (let i = iterations.length - 1; i >= 0; i--) {
+    const it = iterations[i];
+    for (let j = it.stages.length - 1; j >= 0; j--) {
+      const st = it.stages[j];
+      for (let k = st.tasks.length - 1; k >= 0; k--) {
+        if (st.tasks[k].taskId === taskId) {
+          const newTasks = [...st.tasks];
+          newTasks[k] = fn(st.tasks[k]);
+          const newStages = [...it.stages];
+          newStages[j] = { ...st, tasks: newTasks };
+          const newIters = [...iterations];
+          newIters[i] = { ...it, stages: newStages };
+          return newIters;
+        }
+      }
+    }
+  }
+  return iterations;
 }
 
 /**

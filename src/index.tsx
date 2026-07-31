@@ -29,6 +29,28 @@ function exitFullscreen(): void {
   process.stdout.write('\x1b[?1006l\x1b[?1000l' + SHOW_CURSOR + EXIT_ALT_SCREEN);
 }
 
+/**
+ * 非 TTY 模式：从管道 stdin 读取整段输入作为需求。
+ * 必须在 render 之前读完——否则 App 停在输入态，既没有可用的 stdin，
+ * 又没有 keepAlive 清理路径，进程会永远挂住。
+ */
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    // stdin 已经 EOF（如 `npm run dev < empty`）时不会再有 end 事件，直接返回空
+    if (process.stdin.readableEnded) {
+      resolve('');
+      return;
+    }
+    let data = '';
+    process.stdin.setEncoding('utf-8');
+    process.stdin.on('data', (chunk) => {
+      data += chunk;
+    });
+    process.stdin.on('end', () => resolve(data.trim()));
+    process.stdin.on('error', () => resolve(data.trim()));
+  });
+}
+
 export async function main() {
   try {
     const config = loadConfig();
@@ -46,8 +68,21 @@ export async function main() {
       process.on('SIGTERM', () => { restore(); process.exit(0); });
     }
 
-    // 从命令行参数预填需求（可选），否则 App 内部用输入框收集
-    const initialRequest = process.argv[2] || '';
+    // 从命令行参数预填需求（可选）；非 TTY 且无参数时从 stdin 读（管道输入），
+    // 否则 App 会卡在输入态无法提交
+    let initialRequest = process.argv[2] || '';
+    if (!isTty && !initialRequest) {
+      initialRequest = await readStdin();
+      if (!initialRequest) {
+        logError(
+          '启动错误',
+          new Error(
+            '非 TTY 模式必须提供需求：`npm run dev "需求"` 或 `echo "需求" | npm run dev`'
+          )
+        );
+        process.exit(1);
+      }
+    }
 
     // keep-alive interval：阻止 Node 进程在 stdin 暂停或 promise resolve 后
     // 立即退出，让 TUI 能停留在总结面板等用户按 q

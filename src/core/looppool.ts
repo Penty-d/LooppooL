@@ -40,6 +40,9 @@ export class LoopPool {
    * 执行用户请求
    */
   async execute(userRequest: string, userContext?: any): Promise<any> {
+    // 记录启动时间，用于最终结果的真实耗时统计（totalTime 由系统实测，而非 LLM 编造）
+    const startedAt = Date.now();
+
     // 初始化上下文
     const context: Context = {
       requestId: this.generateRequestId(),
@@ -51,6 +54,9 @@ export class LoopPool {
 
     let iteration = 0;
     const maxIterations = this.config.system.maxIterations;
+    // 连续失败熔断：连续 N 次迭代抛错即停止（说明存在稳定故障，重试不会变好）
+    const MAX_CONSECUTIVE_FAILURES = 3;
+    let consecutiveFailures = 0;
     // 上一轮决策给出的 newPlan：第二轮起优先用，避免重复规划丢上下文
     let pendingPlan: import('../types').ExecutionPlan | undefined;
 
@@ -61,7 +67,6 @@ export class LoopPool {
       try {
         // 1. 生成执行计划：第二轮起优先用上轮决策给的 newPlan（基于 agent output 写的）
         //    没有时才回退到 generatePlan（重新规划，但上下文比 newPlan 弱）
-        const usedNewPlan = !!pendingPlan;
         const plan = pendingPlan
           ? this.adoptPendingPlan(pendingPlan)
           : await this.orchestrator.generatePlan(context);
@@ -109,7 +114,7 @@ export class LoopPool {
             totalTasks: context.accumulatedResults.size,
             qualityScore: decision.qualityScore,
           });
-          return this.formatFinalResult(decision, context);
+          return this.formatFinalResult(decision, context, startedAt);
         }
 
         // 决策决定继续：把 newPlan 暂存到下一轮采用
@@ -118,10 +123,20 @@ export class LoopPool {
           pendingPlan = decision.newPlan;
         }
 
+        // 本轮完整成功，清零连续失败计数
+        consecutiveFailures = 0;
+
       } catch (error) {
+        consecutiveFailures++;
         logError(`迭代 ${iteration}`, error);
 
-        if (iteration === maxIterations) {
+        // 达到最大迭代次数，或连续失败超过熔断阈值：直接抛错
+        // 连续失败说明存在稳定故障（模型持续输出坏 JSON / 网络错误等），
+        // 继续重试只是白白烧掉剩余迭代次数。
+        if (
+          iteration === maxIterations ||
+          consecutiveFailures >= MAX_CONSECUTIVE_FAILURES
+        ) {
           throw error;
         }
       }
@@ -135,7 +150,7 @@ export class LoopPool {
       qualityScore: context.history[context.history.length - 1]?.decision.qualityScore,
     });
 
-    return this.formatPartialResult(context);
+    return this.formatPartialResult(context, startedAt);
   }
 
   /**
@@ -155,12 +170,47 @@ export class LoopPool {
   }
 
   /**
+   * 累计本次运行全部任务的成本（USD）。
+   * 未配价格的模型不计入；没有任何成本数据时返回 undefined（最终结果不显示该字段）。
+   */
+  private totalCostUSD(context: Context): number | undefined {
+    let total: number | undefined;
+    for (const r of context.accumulatedResults.values()) {
+      if (typeof r.metrics?.costUSD === 'number') {
+        total = (total ?? 0) + r.metrics.costUSD;
+      }
+    }
+    return total;
+  }
+
+  /**
    * 格式化最终结果
    */
-  private formatFinalResult(decision: Decision, context: Context): any {
+  private formatFinalResult(
+    decision: Decision,
+    context: Context,
+    startedAt: number
+  ): any {
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    const cost = this.totalCostUSD(context);
+
+    // metadata 由系统覆盖：totalTime 用实测耗时（LLM 写的恒为 0），totalCostUSD 按任务实际用量累计
+    const finalResult = decision.finalResult
+      ? {
+          ...decision.finalResult,
+          metadata: {
+            ...(decision.finalResult.metadata ?? {}),
+            totalTime: elapsed,
+            ...(cost !== undefined
+              ? { totalCostUSD: Number(cost.toFixed(4)) }
+              : {}),
+          },
+        }
+      : decision.finalResult;
+
     return {
       status: 'completed',
-      result: decision.finalResult,
+      result: finalResult,
       context: {
         requestId: context.requestId,
         iterations: context.history.length,
@@ -172,14 +222,29 @@ export class LoopPool {
   /**
    * 格式化部分结果（达到最大迭代次数时）
    */
-  private formatPartialResult(context: Context): any {
+  private formatPartialResult(context: Context, startedAt: number): any {
     const lastDecision = context.history[context.history.length - 1]?.decision;
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    const cost = this.totalCostUSD(context);
+
+    const result = lastDecision?.finalResult
+      ? {
+          ...lastDecision.finalResult,
+          metadata: {
+            ...(lastDecision.finalResult.metadata ?? {}),
+            totalTime: elapsed,
+            ...(cost !== undefined
+              ? { totalCostUSD: Number(cost.toFixed(4)) }
+              : {}),
+          },
+        }
+      : lastDecision?.finalResult;
 
     return {
       status: 'partial',
       message: '达到最大迭代次数，返回当前最佳结果',
       qualityScore: lastDecision?.qualityScore || 0,
-      result: lastDecision?.finalResult,
+      result,
       context: {
         requestId: context.requestId,
         iterations: context.history.length,

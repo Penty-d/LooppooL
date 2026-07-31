@@ -64,6 +64,11 @@ export class AgentEngine {
       const provider = this.buildProvider(model);
       const tools = createTools({ workspace: taskWorkspace });
 
+      // 上下文压缩预算：按任务模型的实际 context window 定，缺省回退引擎默认。
+      // 乘 0.9 留安全余量——估算只覆盖 messages，不含 system prompt / 工具 schema / 输出预留。
+      const maxInput = model.maxContextTokens ?? this.maxInputTokens;
+      const compactBudget = Math.floor(maxInput * 0.9);
+
       const messages: ModelMessage[] = [
         { role: 'user', content: task.prompt },
       ];
@@ -77,12 +82,22 @@ export class AgentEngine {
         abortSignal: AbortSignal.timeout(task.timeout ?? this.timeoutDefault),
         onStepFinish: (step) => this.logStep(task.id, step),
         prepareStep: ({ messages }) => {
-          const compacted = this.compactIfNeeded(messages, task.id);
+          const compacted = this.compactIfNeeded(messages, task.id, compactBudget);
           return compacted ? { messages: compacted } : {};
         },
       });
 
       const endTime = new Date();
+
+      // 成本核算：input/output token 分别计费（priceIn1M/priceOut1M，USD/百万 token）
+      const inputTokens = usage?.inputTokens ?? 0;
+      const outputTokens = usage?.outputTokens ?? 0;
+      let costUSD: number | undefined;
+      if (model.priceIn1M != null || model.priceOut1M != null) {
+        costUSD =
+          (inputTokens / 1_000_000) * (model.priceIn1M ?? 0) +
+          (outputTokens / 1_000_000) * (model.priceOut1M ?? 0);
+      }
 
       return {
         taskId: task.id,
@@ -94,8 +109,10 @@ export class AgentEngine {
           duration: endTime.getTime() - startTime.getTime(),
           modelUsed: model.modelId,
           tier: model.tier,
-          tokensUsed:
-            (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0) || undefined,
+          tokensUsed: inputTokens + outputTokens || undefined,
+          inputTokens,
+          outputTokens,
+          costUSD,
           // 把 step 数 / 终止原因放进 suggestions，便于上游 orchestrator 观察
           suggestions: [
             `finishReason=${finishReason}`,
@@ -300,13 +317,14 @@ ${envInfo}
    */
   private compactIfNeeded(
     messages: ModelMessage[],
-    taskId: string
+    taskId: string,
+    budget: number
   ): ModelMessage[] | null {
     const total = messages.reduce(
       (sum, m) => sum + this.estimateMessageTokens(m),
       0
     );
-    if (total <= this.maxInputTokens) return null;
+    if (total <= budget) return null;
 
     // 逐步缩小"保留近 N 步"窗口直到达标，最少保留 1 步
     for (let keepRecent = 4; keepRecent >= 1; keepRecent--) {
@@ -315,14 +333,16 @@ ${envInfo}
         (sum, m) => sum + this.estimateMessageTokens(m),
         0
       );
-      if (newTotal <= this.maxInputTokens) {
+      if (newTotal <= budget) {
         logContextCompaction(taskId, total, newTotal, keepRecent);
         return compacted;
       }
     }
 
-    // 最激进的也压不下来：返回最激进的版本，让 SDK 自己决定（可能直接 413/超限报错）
-    const fallback = this.compactToolResults(messages, 1);
+    // tool-result 压缩到最激进仍超预算：再剥离早期 assistant 的思考文本。
+    // 只替换 text 块、保留 tool-call 块——不影响 tool_use/tool_result 配对，
+    // 比直接把超限上下文发给服务端（必然 413/拒）安全。
+    const fallback = this.stripOldText(this.compactToolResults(messages, 1), 1);
     const newTotal = fallback.reduce(
       (sum, m) => sum + this.estimateMessageTokens(m),
       0
@@ -369,6 +389,40 @@ ${envInfo}
             type: 'text',
             value: `[truncated by LoopPool context compaction: original output ~${origLen} tokens]`,
           },
+        };
+      });
+      return { ...m, content: newContent } as ModelMessage;
+    });
+  }
+
+  /**
+   * 把"老的" assistant 思考文本替换为短占位（最后一次 try 前的兜底）。
+   *
+   * 只替换 assistant 消息里的 text 块，保留 tool-call 块（tool_use 必须有
+   * 对应的 tool_result，删消息会破坏配对）；文本是纯推理内容，剥离后模型
+   * 仍能看到"我之前调用过什么工具、拿到什么结果"。
+   */
+  private stripOldText(
+    messages: ModelMessage[],
+    keepRecentSteps: number
+  ): ModelMessage[] {
+    const assistantIdx: number[] = [];
+    messages.forEach((m, i) => {
+      if (m.role === 'assistant') assistantIdx.push(i);
+    });
+
+    // 最近 keepRecentSteps 个 assistant 消息的文本保留原样
+    const keepFrom = Math.max(0, assistantIdx.length - keepRecentSteps);
+    const toStripIdx = new Set(assistantIdx.slice(0, keepFrom));
+
+    return messages.map((m, i) => {
+      if (!toStripIdx.has(i) || m.role !== 'assistant') return m;
+      const newContent = (m.content as any[]).map((part) => {
+        if (part?.type !== 'text') return part;
+        const origLen = this.estimateTokens(part.text ?? '');
+        return {
+          type: 'text',
+          text: `[reasoning truncated by LoopPool context compaction: ~${origLen} tokens]`,
         };
       });
       return { ...m, content: newContent } as ModelMessage;
@@ -474,14 +528,3 @@ async function patchThinkingSignature(
     headers: res.headers,
   });
 }
-
-/**
- * 自定义 fetch 包装器：给方舟等第三方网关的 thinking block 补 signature 字段
- *
- * 背景：@ai-sdk/anthropic 严格要求 thinking content block 带 signature 字段
- * （Anthropic extended thinking 协议）。方舟 glm-5.2 返回 thinking 但没 signature，
- * 导致 SDK 校验失败、抛 Invalid JSON response。
- *
- * 实现：拦截 /v1/messages 响应，解析 JSON，给缺 signature 的 thinking block
- * 补一个占位值，再重新序列化返回给 SDK。
- */
