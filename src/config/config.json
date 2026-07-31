@@ -6,7 +6,9 @@
     "validationThreshold": 80,
     "taskRetries": 1,
     "approvalMode": "none",
-    "dangerousShell": "ask"
+    "dangerousShell": "ask",
+    "budgetUSD": 0,
+    "contextSummarizer": ""
   },
   "logging": {
     "level": "info",
@@ -15,6 +17,7 @@
   },
   "storage": {
     "persistHistory": true,
-    "historyPath": "./data/history"
+    "historyPath": "./data/history",
+    "projectKey": ""
   }
 }

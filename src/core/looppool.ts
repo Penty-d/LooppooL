@@ -16,6 +16,8 @@ import { TaskPool } from './task-pool';
 import { CheckpointStore, CheckpointStatus } from '../storage';
 import { requestConfirm } from '../confirm';
 import { PlanRejectedError } from '../errors';
+import { requestLog } from '../observability';
+import { loadRunLog, appendRunLog } from '../run-log';
 import {
   logIteration,
   logError,
@@ -27,12 +29,17 @@ import {
   logTaskDone,
   logStageSummary,
   logDecision,
+  logBudgetExceeded,
 } from '../ui';
 
 /** LoopPool 构造选项（CLI 覆盖用） */
 export interface LoopPoolOptions {
   /** 计划审批模式覆盖（--approve/--no-approve）；优先于 config */
   approvalMode?: ApprovalMode;
+  /** 成本预算覆盖（--budget）；优先于 config */
+  budgetUSD?: number;
+  /** 项目运行日志 key 覆盖（--project）；优先于 config */
+  projectKey?: string;
 }
 
 export class LoopPool {
@@ -42,6 +49,8 @@ export class LoopPool {
   private taskPool: TaskPool;
   private executor: TaskExecutor;
   private approvalMode: ApprovalMode;
+  private budgetUSD: number;
+  private projectKey?: string;
 
   /**
    * 检查点存储：config.storage.persistHistory=false 时为 null（不落盘、不可恢复）。
@@ -53,6 +62,11 @@ export class LoopPool {
     this.config = config;
     this.models = models;
 
+    // 审批模式 / 成本预算 / 运行日志 key：CLI 覆盖 > config > 默认
+    this.approvalMode = options.approvalMode ?? config.system.approvalMode ?? 'none';
+    this.budgetUSD = options.budgetUSD ?? config.system.budgetUSD ?? 0;
+    this.projectKey = options.projectKey ?? config.storage.projectKey;
+
     // 模型库：把模型条目 id 解析为具体模型（含并发能力）；并向调度器提供可用模型清单
     const registry = new ModelRegistry(models);
 
@@ -63,7 +77,7 @@ export class LoopPool {
 
     // 调度器：直连 Anthropic 协议端点（手写 fetch），返回结构化 JSON
     const client = new AnthropicClient(models.orchestrator);
-    this.orchestrator = new Orchestrator(client, registry);
+    this.orchestrator = new Orchestrator(client, registry, { budgetUSD: this.budgetUSD });
 
     // 任务池：按模型并发能力调度并行/串行，失败任务自动重试 taskRetries 次
     this.taskPool = new TaskPool(
@@ -72,9 +86,6 @@ export class LoopPool {
       config.system.globalParallelLimit,
       config.system.taskRetries
     );
-
-    // 计划审批模式：CLI 覆盖 > config > 默认 none
-    this.approvalMode = options.approvalMode ?? config.system.approvalMode ?? 'none';
 
     // 断点持久化：尊重 persistHistory 开关
     this.checkpointStore = config.storage.persistHistory
@@ -99,7 +110,13 @@ export class LoopPool {
       userContext,
     };
 
-    return this.runLoop({ context, startedAt, iteration: 0, pendingPlan: undefined });
+    // NDJSON 请求日志：整次 run 的事件流落盘
+    requestLog.start(context.requestId);
+    try {
+      return await this.runLoop({ context, startedAt, iteration: 0, pendingPlan: undefined });
+    } finally {
+      requestLog.stop();
+    }
   }
 
   /**
@@ -132,12 +149,31 @@ export class LoopPool {
     // 先把历史迭代折叠重放到 TUI，再继续流式跑新迭代
     this.replayHistory(context.history);
 
-    return this.runLoop({
-      context,
-      startedAt: ckpt.startedAt, // 沿用原 startedAt，totalTime 跨崩溃累计
-      iteration: context.history.length,
-      pendingPlan: ckpt.pendingPlan,
-    });
+    requestLog.start(context.requestId);
+    try {
+      return await this.runLoop({
+        context,
+        startedAt: ckpt.startedAt, // 沿用原 startedAt，totalTime 跨崩溃累计
+        iteration: context.history.length,
+        pendingPlan: ckpt.pendingPlan,
+      });
+    } finally {
+      requestLog.stop();
+    }
+  }
+
+  /** 取消一个运行中的任务（TUI 的 c 键） */
+  cancelTask(taskId: string): void {
+    this.taskPool.cancelTask(taskId);
+  }
+
+  /** 暂停任务池：不再启动新任务（TUI 的 p 键） */
+  pausePool(): void {
+    this.taskPool.pause();
+  }
+
+  resumePool(): void {
+    this.taskPool.resume();
   }
 
   /**
@@ -226,7 +262,32 @@ export class LoopPool {
             totalTasks: context.accumulatedResults.size,
             qualityScore: decision.qualityScore,
           });
-          return this.formatFinalResult(decision, context, startedAt);
+          const finalResult = this.formatFinalResult(decision, context, startedAt);
+          this.logRun(context, { status: 'completed', result: finalResult });
+          return finalResult;
+        }
+
+        // 成本预算硬停：只有"模型说继续但已超预算"才强制停
+        // （预算内"完成"仍走上面的 completed 分支；无价格数据 costUSD=undefined 当 0，不误触）
+        if (this.budgetUSD > 0) {
+          const spent = this.totalCostUSD(context) ?? 0;
+          if (spent > this.budgetUSD) {
+            logBudgetExceeded(spent, this.budgetUSD);
+            this.checkpoint(context, {
+              pendingPlan: undefined,
+              startedAt,
+              status: 'completed',
+            });
+            printFinalSummary({
+              status: 'partial',
+              iterations: iteration,
+              totalTasks: context.accumulatedResults.size,
+              qualityScore: context.history[context.history.length - 1]?.decision.qualityScore,
+            });
+            const partialResult = this.formatPartialResult(context, startedAt);
+            this.logRun(context, { status: 'partial', result: partialResult });
+            return partialResult;
+          }
         }
 
         // 决策决定继续：把 newPlan 暂存到下一轮采用
@@ -279,7 +340,9 @@ export class LoopPool {
       qualityScore: context.history[context.history.length - 1]?.decision.qualityScore,
     });
 
-    return this.formatPartialResult(context, startedAt);
+    const partialResult = this.formatPartialResult(context, startedAt);
+    this.logRun(context, { status: 'partial', result: partialResult });
+    return partialResult;
   }
 
   /**
@@ -386,7 +449,9 @@ export class LoopPool {
               task.id,
               result.status === 'success',
               result.metrics.duration,
-              result.metrics.modelUsed
+              result.metrics.modelUsed,
+              result.metrics.tokensUsed,
+              result.metrics.costUSD
             );
           }
           // 无结果的任务（critical-failure 中止 / serial break 未执行）保持 ○ 未完成态
@@ -437,6 +502,32 @@ export class LoopPool {
       }
     }
     return total;
+  }
+
+  /**
+   * 把本次 run 的要点写进项目运行日志（仅当配置了 projectKey）。
+   * 这是可观测性（人类/排查看），不注入规划 prompt。
+   */
+  private logRun(context: Context, opts: { status: string; result: any }): void {
+    if (!this.projectKey) return;
+    try {
+      const finalResult = opts.result?.result;
+      const summary =
+        (typeof finalResult?.summary === 'string' ? finalResult.summary : '') ||
+        context.history[context.history.length - 1]?.decision?.reason ||
+        '';
+      const outputs = finalResult?.outputs
+        ? Object.keys(finalResult.outputs).slice(0, 8).join(', ')
+        : '';
+      const cost = this.totalCostUSD(context);
+      const entry =
+        `[${new Date().toISOString().slice(0, 10)}] req=${context.requestId} ` +
+        `status=${opts.status} 总结=${summary.slice(0, 300)} 产物=${outputs} ` +
+        `cost=${cost !== undefined ? cost.toFixed(4) : '?'}`;
+      appendRunLog(this.projectKey, entry);
+    } catch (error) {
+      logError('运行日志写入失败', error);
+    }
   }
 
   /**

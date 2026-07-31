@@ -98,6 +98,10 @@ export function App({
   // Esc 防抖：裸 \x1B 可能是箭头键的前缀，等一小段时间看是否有后续字节
   const escTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // ── 任务池暂停状态（TUI 的 p 键）──
+  const poolPausedRef = useRef(false);
+  const [poolPaused, setPoolPaused] = useState(false);
+
   // 注册确认响应方（TTY 专属；非 TTY 由 index.tsx 注册，单槽替换）。
   // 声明在 run-start effect 之前，保证确认不会"未接线"。
   useEffect(() => {
@@ -185,6 +189,20 @@ export function App({
         } else if (btn === 65) {
           setDetailScroll((i) => i + 3);
         }
+        return;
+      }
+
+      // 取消选中的运行中任务 / 暂停-恢复任务池（确认态已被上面的拦截吞掉，不会误触）
+      if (s === 'c') {
+        const t = allTasksRef.current[selectedIdxRef.current];
+        if (t && t.ok === undefined) loopPool.cancelTask(t.taskId);
+        return;
+      }
+      if (s === 'p') {
+        const next = !poolPausedRef.current;
+        poolPausedRef.current = next;
+        setPoolPaused(next);
+        next ? loopPool.pausePool() : loopPool.resumePool();
         return;
       }
 
@@ -376,6 +394,7 @@ export function App({
         iteration={localState.iterations[localState.iterations.length - 1]?.iteration}
         maxIterations={localState.iterations[localState.iterations.length - 1]?.maxIterations}
         score={localState.iterations[localState.iterations.length - 1]?.decision?.qualityScore ?? localState.finalSummary?.qualityScore}
+        paused={poolPaused}
       />
     </Box>
   );

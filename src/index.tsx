@@ -59,10 +59,19 @@ export async function main() {
     const config = loadConfig();
     const models = loadModelsConfig();
 
-    // 解析 argv：--resume [requestId] / --approve / --no-approve / 需求
+    // 解析 argv：--resume [requestId] / --approve / --no-approve / --budget <usd> / --project <key> / 需求
     const argv = process.argv.slice(2);
     const resumeIdx = argv.indexOf('--resume');
     const resuming = resumeIdx !== -1;
+
+    const valueFlags = new Set(['--resume', '--budget', '--project']);
+    // 取值 flag 的值占用的下标（避免被当成需求）
+    const valueIdx = new Set<number>();
+    argv.forEach((a, i) => {
+      if (valueFlags.has(a) && argv[i + 1] && !argv[i + 1].startsWith('--')) {
+        valueIdx.add(i + 1);
+      }
+    });
 
     // 计划审批覆盖：--approve=initial / --no-approve=none，后出现者优先（都出现时 --no-approve 更安全）
     const approveIdx = argv.indexOf('--approve');
@@ -74,7 +83,29 @@ export async function main() {
       approvalOverride = 'initial';
     }
 
-    const loopPool = new LoopPool(config, models, { approvalMode: approvalOverride });
+    // --budget <usd>
+    const budgetIdx = argv.indexOf('--budget');
+    let budgetOverride: number | undefined;
+    if (budgetIdx !== -1) {
+      const raw = Number(argv[budgetIdx + 1]);
+      if (Number.isFinite(raw) && raw > 0) {
+        budgetOverride = raw;
+      } else {
+        logError('启动错误', new Error('--budget 需要正数（USD），如 --budget 0.5'));
+        process.exit(1);
+      }
+    }
+
+    // --project <key>
+    const projectIdx = argv.indexOf('--project');
+    let projectOverride: string | undefined;
+    if (projectIdx !== -1) projectOverride = argv[projectIdx + 1];
+
+    const loopPool = new LoopPool(config, models, {
+      approvalMode: approvalOverride,
+      budgetUSD: budgetOverride,
+      projectKey: projectOverride,
+    });
 
     const isTty = process.stdin.isTTY === true;
 
@@ -139,7 +170,10 @@ export async function main() {
       resumeRequestId = requestId;
       initialRequest = ckpt.userRequest; // App 直接进 running 态，Header 显示原需求
     } else {
-      initialRequest = argv[0] || '';
+      // 需求 = 第一个既不是 flag 也不是 flag 值的参数
+      // （修复：--budget 0.5 --project demo "需求" 时，0.5/demo 是 flag 值，不能当需求）
+      initialRequest =
+        argv.find((a, i) => !a.startsWith('--') && !valueIdx.has(i)) ?? '';
       if (!isTty && !initialRequest) {
         // 非 TTY：从管道 stdin 读需求，否则 App 会卡在输入态无法提交
         initialRequest = await readStdin();

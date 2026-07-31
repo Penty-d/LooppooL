@@ -256,6 +256,10 @@ export interface SystemConfig {
   approvalMode: ApprovalMode;
   /** 危险 shell 命令管控模式，见 DangerousShellMode */
   dangerousShell: DangerousShellMode;
+  /** 单次 run 成本预算（USD）；0 = 不限制。超预算强制停止迭代 */
+  budgetUSD?: number;
+  /** 上下文压缩时用的摘要模型条目 id；缺省复用任务自身模型 */
+  contextSummarizer?: string;
 }
 
 export interface Config {
@@ -268,5 +272,7 @@ export interface Config {
   storage: {
     persistHistory: boolean;
     historyPath: string;
+    /** 项目运行日志 key（--project 覆盖）；空则禁用跨 run 日志 */
+    projectKey?: string;
   };
 }

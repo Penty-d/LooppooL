@@ -126,11 +126,13 @@ export function logTaskDone(
   taskId: string,
   ok: boolean,
   durationMs: number,
-  modelUsed: string
+  modelUsed: string,
+  tokensUsed?: number,
+  costUSD?: number
 ): void {
   bus.dispatch({
     type: 'task-done',
-    payload: { taskId, ok, durationMs, modelUsed, ts: now() },
+    payload: { taskId, ok, durationMs, modelUsed, tokensUsed, costUSD, ts: now() },
   });
 }
 
@@ -216,6 +218,30 @@ export function logContextCompaction(
   bus.dispatch({
     type: 'context-compaction',
     payload: { taskId, beforeTokens, afterTokens, keptSteps, ts: now() },
+  });
+}
+
+/** 上下文压缩时用摘要模型把老对话压成工作摘要 */
+export function logContextSummarized(
+  taskId: string,
+  beforeTokens: number,
+  afterTokens: number
+): void {
+  bus.dispatch({
+    type: 'context-summarized',
+    payload: { taskId, beforeTokens, afterTokens, ts: now() },
+  });
+}
+
+/** 成本预算超支告警（强制停止迭代） */
+export function logBudgetExceeded(spent: number, budget: number): void {
+  bus.dispatch({
+    type: 'log',
+    payload: {
+      level: 'warn',
+      message: `预算超支：已花费 $${spent.toFixed(4)}（预算 $${budget}），强制停止本轮迭代`,
+      ts: now(),
+    },
   });
 }
 

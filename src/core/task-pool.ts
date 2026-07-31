@@ -30,6 +30,12 @@ export class TaskPool {
   private registry: ModelRegistry;
   private globalParallelLimit: number;
   private taskRetries: number;
+  /** 运行中任务的 AbortController，供 cancelTask 中止 */
+  private runningControllers = new Map<string, AbortController>();
+  /** 已被用户取消的任务 id（取消不自动重试） */
+  private canceled = new Set<string>();
+  /** 任务池暂停标志（暂停 = 不再启动新任务，不中断运行中的任务） */
+  private paused = false;
 
   constructor(
     executor: TaskExecutor,
@@ -46,8 +52,10 @@ export class TaskPool {
   /** 执行完整的执行计划 */
   async executePlan(plan: ExecutionPlan): Promise<Map<string, ExecutionResult>> {
     const allResults = new Map<string, ExecutionResult>();
+    this.canceled.clear(); // 防止上一轮取消误伤本轮同名任务
 
     for (let i = 0; i < plan.stages.length; i++) {
+      await this.waitIfPaused(); // 暂停时不再启动新 stage
       const stage = plan.stages[i];
       logStage(i + 1, plan.stages.length, stage.id, stage.mode, stage.tasks.length);
 
@@ -88,7 +96,9 @@ export class TaskPool {
     let completed = 0;
 
     return new Promise((resolve) => {
-      const tryDispatch = () => {
+      const tryDispatch = async () => {
+        await this.waitIfPaused();
+
         // 全部完成（按已结束任务数判断，不受重复 id 影响）
         if (completed === tasks.length && running === 0) {
           resolve(results);
@@ -100,6 +110,18 @@ export class TaskPool {
           if (running >= this.globalParallelLimit) break;
 
           const task = pending[i];
+
+          // 已被取消的任务：直接标记失败，不入队执行
+          if (this.canceled.has(task.id)) {
+            this.canceled.delete(task.id);
+            const err = new Error(`任务 ${task.id} 已被用户取消`);
+            results.set(task.id, this.toFailure(task, err));
+            logTaskDone(task.id, false, 0, 'unknown');
+            pending.splice(i, 1);
+            completed++;
+            continue; // splice 后当前下标已是下一个任务
+          }
+
           const model = this.safeResolveConcurrency(task);
           const key = model.key;
           const inFlight = perModelRunning.get(key) || 0;
@@ -141,6 +163,17 @@ export class TaskPool {
     const results = new Map<string, ExecutionResult>();
 
     for (const task of tasks) {
+      await this.waitIfPaused();
+
+      // 已被取消的任务：标记失败后断链
+      if (this.canceled.has(task.id)) {
+        this.canceled.delete(task.id);
+        const err = new Error(`任务 ${task.id} 已被用户取消`);
+        results.set(task.id, this.toFailure(task, err));
+        logTaskDone(task.id, false, 0, 'unknown');
+        break;
+      }
+
       const result = await this.executeTaskWithRetries(task);
       results.set(task.id, result);
 
@@ -168,21 +201,29 @@ export class TaskPool {
     }
   }
 
-  private async executeTaskWithLogging(task: Task): Promise<ExecutionResult> {
+  private async executeTaskWithLogging(
+    task: Task,
+    signal?: AbortSignal
+  ): Promise<ExecutionResult> {
     logTaskStart(task.id, task.model, task.description, task.kind);
 
     try {
-      const result = await this.executor.execute(task);
+      const result = await this.executor.execute(task, signal);
       logTaskDone(
         task.id,
         result.status === 'success',
         result.metrics.duration,
-        result.metrics.modelUsed
+        result.metrics.modelUsed,
+        result.metrics.tokensUsed,
+        result.metrics.costUSD
       );
       return result;
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       logTaskError(task.id, msg);
+      // 执行抛错（validate 缺目标 / abort 等）也必须发 task-done，
+      // 否则 TUI 里该任务永远显示"运行中"
+      logTaskDone(task.id, false, 0, task.model);
       return this.toFailure(task, error);
     }
   }
@@ -190,13 +231,27 @@ export class TaskPool {
   /**
    * 执行任务并带失败重试（指数退避 1s/2s/4s…）。
    * retryable === false → 只尝试一次（显式不重试）；否则最多 1 + taskRetries 次。
+   * 每次尝试挂在 runningControllers 上，取消可中止进行中的请求。
    */
   private async executeTaskWithRetries(task: Task): Promise<ExecutionResult> {
     const maxAttempts = task.retryable === false ? 1 : 1 + this.taskRetries;
     let result: ExecutionResult | undefined;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      result = await this.executeTaskWithLogging(task);
+      const controller = new AbortController();
+      this.runningControllers.set(task.id, controller);
+      try {
+        result = await this.executeTaskWithLogging(task, controller.signal);
+      } finally {
+        this.runningControllers.delete(task.id);
+      }
+
+      // 用户取消：不自动重试，直接结束
+      if (this.canceled.has(task.id)) {
+        this.canceled.delete(task.id);
+        break;
+      }
+
       if (result.status !== 'failed' || attempt === maxAttempts) {
         return result;
       }
@@ -206,6 +261,31 @@ export class TaskPool {
     }
 
     return result!;
+  }
+
+  /**
+   * 取消一个运行中的任务（后续不自动重试）。
+   * 未启动（还在 pending）的任务由派发循环消费；已启动的任务通过 abort 中止。
+   */
+  cancelTask(taskId: string): void {
+    this.canceled.add(taskId); // 先标记，保证重试/派发检查一定能看到
+    this.runningControllers.get(taskId)?.abort();
+  }
+
+  /** 暂停任务池：不再启动新任务（不中断运行中的任务） */
+  pause(): void {
+    this.paused = true;
+  }
+
+  resume(): void {
+    this.paused = false;
+  }
+
+  /** 暂停时等待恢复（轮询 200ms） */
+  private async waitIfPaused(): Promise<void> {
+    while (this.paused) {
+      await new Promise((r) => setTimeout(r, 200));
+    }
   }
 
   private toFailure(task: Task, error: unknown): ExecutionResult {

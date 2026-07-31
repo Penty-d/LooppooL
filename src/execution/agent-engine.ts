@@ -5,7 +5,13 @@ import { resolve as pathResolve } from 'path';
 import { Task, ExecutionResult } from '../types';
 import { ResolvedModel } from './model-registry';
 import { createTools } from './tools';
-import { logToolCall, logToolResult, logAgentText, logContextCompaction } from '../ui';
+import {
+  logToolCall,
+  logToolResult,
+  logAgentText,
+  logContextCompaction,
+  logContextSummarized,
+} from '../ui';
 
 /**
  * Agent 执行引擎（基于 Vercel AI SDK）
@@ -22,6 +28,8 @@ export class AgentEngine {
   private timeoutDefault: number;
   private maxInputTokens: number;
   private dangerousShell: 'ask' | 'deny' | 'allow';
+  /** 测试接缝：注入假摘要器，跳过真实模型调用（prod 为 undefined） */
+  private summarizerOverride?: (prompt: string) => Promise<string | null>;
 
   constructor(opts: {
     workspace?: string;
@@ -37,6 +45,8 @@ export class AgentEngine {
     maxInputTokens?: number;
     /** 危险 shell 命令管控模式（透传给 createTools） */
     dangerousShell?: 'ask' | 'deny' | 'allow';
+    /** 测试接缝：假摘要器 */
+    summarizerOverride?: (prompt: string) => Promise<string | null>;
   } = {}) {
     // 缺省给所有任务一个共享 workspace；调用方也可在 task.input.workspace 覆盖
     this.workspace = pathResolve(opts.workspace ?? './.looppool-workspace');
@@ -44,10 +54,16 @@ export class AgentEngine {
     this.timeoutDefault = opts.timeoutDefault ?? 1_800_000;
     this.maxInputTokens = opts.maxInputTokens ?? 200_000;
     this.dangerousShell = opts.dangerousShell ?? 'ask';
+    this.summarizerOverride = opts.summarizerOverride;
     mkdirSync(this.workspace, { recursive: true });
   }
 
-  async run(task: Task, model: ResolvedModel): Promise<ExecutionResult> {
+  async run(
+    task: Task,
+    model: ResolvedModel,
+    signal?: AbortSignal,
+    summarizerModel?: ResolvedModel
+  ): Promise<ExecutionResult> {
     const startTime = new Date();
     // 工作目录决策（优先级从高到低）：
     //   1. task.workdir —— 调度器显式指定（侦察/优化现有项目时必填）
@@ -80,16 +96,29 @@ export class AgentEngine {
         { role: 'user', content: task.prompt },
       ];
 
+      // 合并超时 + 外部取消信号：外部取消（任务池 cancelTask）会中止进行中的请求
+      const timeoutSignal = AbortSignal.timeout(task.timeout ?? this.timeoutDefault);
+      const abortSignal = signal
+        ? AbortSignal.any([timeoutSignal, signal])
+        : timeoutSignal;
+
       const { text, steps, finishReason, usage } = await generateText({
         model: provider(model.modelId),
         system: this.systemPrompt(taskWorkspace, task),
         messages,
         tools,
         stopWhen: stepCountIs(this.maxSteps),
-        abortSignal: AbortSignal.timeout(task.timeout ?? this.timeoutDefault),
+        abortSignal,
         onStepFinish: (step) => this.logStep(task.id, step),
-        prepareStep: ({ messages }) => {
-          const compacted = this.compactIfNeeded(messages, task.id, compactBudget);
+        prepareStep: async ({ messages }) => {
+          const compacted = await this.compactIfNeeded(
+            messages,
+            task,
+            model,
+            compactBudget,
+            abortSignal,
+            summarizerModel
+          );
           return compacted ? { messages: compacted } : {};
         },
       });
@@ -322,11 +351,14 @@ ${envInfo}
    *
    * 注意：不能丢消息（会破坏 tool_use ↔ tool_result 配对），只能改内容。
    */
-  private compactIfNeeded(
+  private async compactIfNeeded(
     messages: ModelMessage[],
-    taskId: string,
-    budget: number
-  ): ModelMessage[] | null {
+    task: Task,
+    model: ResolvedModel,
+    budget: number,
+    signal?: AbortSignal,
+    summarizerModel?: ResolvedModel
+  ): Promise<ModelMessage[] | null> {
     const total = messages.reduce(
       (sum, m) => sum + this.estimateMessageTokens(m),
       0
@@ -341,21 +373,179 @@ ${envInfo}
         0
       );
       if (newTotal <= budget) {
-        logContextCompaction(taskId, total, newTotal, keepRecent);
+        logContextCompaction(task.id, total, newTotal, keepRecent);
         return compacted;
       }
     }
 
-    // tool-result 压缩到最激进仍超预算：再剥离早期 assistant 的思考文本。
-    // 只替换 text 块、保留 tool-call 块——不影响 tool_use/tool_result 配对，
-    // 比直接把超限上下文发给服务端（必然 413/拒）安全。
+    // tool-result 压缩到最激进仍超预算 → 先用摘要模型把老对话压成工作摘要
+    // （摘要失败 / 摘要后仍超预算 → 兜底剥离早期文本）
+    try {
+      const summarized = await this.summarizeConversation(
+        messages,
+        task,
+        model,
+        budget,
+        signal,
+        summarizerModel
+      );
+      if (summarized) return summarized;
+    } catch {
+      // 摘要失败（含 abort）→ 走兜底
+    }
+
+    // 兜底：剥离早期 assistant 的思考文本（只替换 text 块、保留 tool-call 块，
+    // 不影响 tool_use/tool_result 配对，比把超限上下文发给服务端安全）
     const fallback = this.stripOldText(this.compactToolResults(messages, 1), 1);
     const newTotal = fallback.reduce(
       (sum, m) => sum + this.estimateMessageTokens(m),
       0
     );
-    logContextCompaction(taskId, total, newTotal, 1);
+    logContextCompaction(task.id, total, newTotal, 1);
     return fallback;
+  }
+
+  /**
+   * 用摘要模型把老对话压成一条工作摘要，替换掉 messages[1..keepFrom) 段
+   * （保留首条 user 消息 + 最近 keepRecent 步，tool-call/tool-result 配对不破坏）。
+   * 从 keepRecent=4 逐档降到 1，找第一个能塞进预算的组合；全失败返回 null。
+   */
+  private async summarizeConversation(
+    messages: ModelMessage[],
+    task: Task,
+    model: ResolvedModel,
+    budget: number,
+    signal?: AbortSignal,
+    summarizerModel?: ResolvedModel
+  ): Promise<ModelMessage[] | null> {
+    const sumModel = summarizerModel ?? model;
+
+    for (let keepRecent = 4; keepRecent >= 1; keepRecent--) {
+      const keepFrom = this.findKeepFrom(messages, keepRecent);
+      if (!keepFrom) continue; // 没有可总结的老内容
+
+      // 预检查：保留部分 + 摘要占位 > 预算则跳过（摘要也塞不下）
+      const recentTokens = this.estimateMessageRange(messages, keepFrom);
+      if (recentTokens + 1000 > budget) continue;
+
+      const summary = await this.callSummarizer(
+        messages.slice(1, keepFrom),
+        sumModel,
+        signal
+      );
+      if (!summary) continue;
+
+      const newMessages = applySummaryReplacement(messages, keepFrom, summary);
+      const newTotal = newMessages.reduce(
+        (sum, m) => sum + this.estimateMessageTokens(m),
+        0
+      );
+      if (newTotal <= budget) {
+        logContextSummarized(task.id, recentTokens, newTotal);
+        return newMessages;
+      }
+    }
+
+    return null;
+  }
+
+  /** 找"从后数第 keepRecent 步"的起点（assistant 消息索引）；没有老内容可总结返回 undefined */
+  private findKeepFrom(
+    messages: ModelMessage[],
+    keepRecent: number
+  ): number | undefined {
+    const assistantIdx: number[] = [];
+    messages.forEach((m, i) => {
+      if (m.role === 'assistant') assistantIdx.push(i);
+    });
+    if (assistantIdx.length <= keepRecent) return undefined;
+    return assistantIdx[Math.max(0, assistantIdx.length - keepRecent)];
+  }
+
+  /** messages[from..] 的估算 token 总和 */
+  private estimateMessageRange(messages: ModelMessage[], from: number): number {
+    let total = 0;
+    for (let i = from; i < messages.length; i++) {
+      total += this.estimateMessageTokens(messages[i]);
+    }
+    return total;
+  }
+
+  /** 把一条消息压成一行简报文本（text / tool-call / tool-result 均截断） */
+  private serializeMessageBrief(m: ModelMessage): string {
+    if (typeof m.content === 'string') return `${m.role}: ${m.content}`;
+    if (!Array.isArray(m.content)) return `${m.role}: <...>`;
+
+    const parts: string[] = [];
+    for (const part of m.content as any[]) {
+      if (part?.type === 'text' && typeof part.text === 'string') {
+        parts.push(`text: ${this.brief(part.text, 400)}`);
+      } else if (part?.type === 'tool-call') {
+        parts.push(
+          `tool_call: ${part.toolName}(${this.brief(JSON.stringify(part.args), 200)})`
+        );
+      } else if (part?.type === 'tool-result') {
+        const out =
+          typeof part.output === 'string'
+            ? part.output
+            : JSON.stringify(part.output);
+        parts.push(`tool_result(${part.toolName}): ${this.brief(out, 300)}`);
+      }
+    }
+    return `${m.role}: ${parts.join(' | ')}`;
+  }
+
+  /** 序列化老消息为摘要模型的输入文本（超 tokenCap 截断，保留较早内容） */
+  private serializeForSummary(messages: ModelMessage[], tokenCap = 40_000): string {
+    const parts: string[] = [];
+    let used = 0;
+    for (const m of messages) {
+      const line = this.serializeMessageBrief(m);
+      used += this.estimateTokens(line);
+      if (used > tokenCap && parts.length > 0) break;
+      parts.push(line);
+    }
+    return parts.join('\n');
+  }
+
+  /**
+   * 调用摘要模型：普通 generateText（无 tools / prepareStep / stopWhen，不递归）。
+   * 返回摘要文本；失败 / 空 / 被中止返回 null。
+   */
+  private async callSummarizer(
+    oldMessages: ModelMessage[],
+    model: ResolvedModel,
+    signal?: AbortSignal
+  ): Promise<string | null> {
+    const prompt = this.serializeForSummary(oldMessages);
+
+    // 测试接缝：外部注入的假摘要器
+    if (this.summarizerOverride) {
+      try {
+        const r = await this.summarizerOverride(prompt);
+        return r && r.trim() ? r.trim() : null;
+      } catch {
+        return null;
+      }
+    }
+
+    try {
+      const provider = this.buildProvider(model);
+      const system =
+        '你是对话压缩助手。把下面这段 agent 执行过程中的早期对话压缩成简洁的中文工作摘要，' +
+        '保留：已完成的事实、产出的文件、关键命令结果、待办/遗留问题。不要编造，不要保留无关细节。';
+      const { text } = await generateText({
+        model: provider(model.modelId),
+        system,
+        messages: [{ role: 'user', content: prompt }],
+        maxOutputTokens: 600,
+        abortSignal: signal,
+      });
+      const t = (text ?? '').trim();
+      return t.length > 0 ? t : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -534,4 +724,21 @@ async function patchThinkingSignature(
     statusText: res.statusText,
     headers: res.headers,
   });
+}
+
+/**
+ * 纯函数：用一条摘要 assistant 消息替换 messages[1..keepFrom) 段，
+ * 保留首条 user 消息（原始任务）和 keepFrom 起的尾部（最近步骤，tool 配对完好）。
+ * 导出供 smoke 测试断言结构不变量。
+ */
+export function applySummaryReplacement(
+  messages: ModelMessage[],
+  keepFrom: number,
+  summaryText: string
+): ModelMessage[] {
+  return [
+    messages[0],
+    { role: 'assistant', content: `[工作摘要]\n${summaryText}` },
+    ...messages.slice(keepFrom),
+  ];
 }
