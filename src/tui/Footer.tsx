@@ -13,6 +13,7 @@ export function Footer({
   iteration,
   maxIterations,
   score,
+  paused,
 }: {
   finished: boolean;
   isTty: boolean;
@@ -23,6 +24,7 @@ export function Footer({
   iteration?: number;
   maxIterations?: number;
   score?: number;
+  paused?: boolean;
 }) {
   if (!isTty) {
     return (
@@ -34,12 +36,13 @@ export function Footer({
 
   const left = finished
     ? '执行已结束 · Enter/s 切换总结/详情 · q 退出'
-    : `↑↓ 切任务 (${selectedIdx + 1}/${taskCount || 1}) · 滚轮看详情 · Enter 展开 · q 退出`;
+    : `↑↓ 切任务 (${selectedIdx + 1}/${taskCount || 1}) · 滚轮看详情 · Enter 展开 · c 取消 · p ${paused ? '恢复' : '暂停'} · q 退出`;
 
   const rightParts: string[] = [];
   if (iteration && maxIterations) rightParts.push(`迭代 ${iteration}/${maxIterations}`);
   rightParts.push(`任务 ${taskCount}`);
   if (score !== undefined) rightParts.push(`评分 ${score}`);
+  if (paused) rightParts.push('⏸ 已暂停');
   const right = rightParts.join(' · ');
 
   return (

@@ -42,12 +42,27 @@ export interface ContextCompactionEvent {
   ts: number;
 }
 
+/** 上下文压缩时用摘要模型把老对话压成工作摘要（F1） */
+export interface ContextSummarizedEvent {
+  taskId: string;
+  beforeTokens: number;
+  afterTokens: number;
+  ts: number;
+}
+
 export type LogLevel = 'info' | 'warn' | 'error';
 
 export interface LogEvent {
   level: LogLevel;
   message: string;
   detailsPath?: string;
+  ts: number;
+}
+
+/** 人工确认请求（计划审批 / 危险命令确认）。响应走 confirm.ts 的 respondConfirm，不经过事件总线。 */
+export interface UserConfirmEvent {
+  id: string;
+  message: string;
   ts: number;
 }
 
@@ -93,6 +108,10 @@ export interface TaskDoneEvent {
   ok: boolean;
   durationMs: number;
   modelUsed: string;
+  /** 本次任务消耗的 token 数（可观测性用） */
+  tokensUsed?: number;
+  /** 本次任务成本 USD（可观测性用） */
+  costUSD?: number;
   ts: number;
 }
 
@@ -142,7 +161,31 @@ export type UiEvent =
   | { type: 'decision'; payload: DecisionEvent }
   | { type: 'final-summary'; payload: FinalSummaryEvent }
   | { type: 'final-result'; payload: FinalResultEvent }
-  | { type: 'log'; payload: LogEvent };
+  | { type: 'log'; payload: LogEvent }
+  | { type: 'user-confirm'; payload: UserConfirmEvent }
+  | { type: 'context-summarized'; payload: ContextSummarizedEvent };
+
+/** 全部事件类型（供 RequestLog 订阅 / useTuiState 对齐；新事件必须加进这个列表） */
+export const ALL_EVENT_TYPES: UiEvent['type'][] = [
+  'banner',
+  'request',
+  'iteration-start',
+  'plan-ready',
+  'stage-start',
+  'stage-summary',
+  'task-start',
+  'task-done',
+  'tool-call',
+  'tool-result',
+  'agent-text',
+  'context-compaction',
+  'context-summarized',
+  'decision',
+  'final-summary',
+  'final-result',
+  'log',
+  'user-confirm',
+];
 
 class UiEventBus extends EventEmitter {
   emit(type: UiEvent['type'], payload: any): boolean {

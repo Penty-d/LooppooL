@@ -19,6 +19,12 @@ export interface ResolvedModel {
   authMode: AuthMode;
   /** 该模型是否支持并发（缺省 true） */
   concurrent: boolean;
+  /** context window（token），AgentEngine 压缩阈值用；缺省回退引擎默认 */
+  maxContextTokens?: number;
+  /** 每百万 input token 成本（USD），成本核算用 */
+  priceIn1M?: number;
+  /** 每百万 output token 成本（USD），成本核算用 */
+  priceOut1M?: number;
 }
 
 /** 给调度器看的模型清单条目（不含密钥等敏感信息） */
@@ -74,6 +80,9 @@ export class ModelRegistry {
       apiKey: provider.apiKey,
       authMode,
       concurrent: entry.concurrent !== false,
+      maxContextTokens: entry.maxContextTokens,
+      priceIn1M: entry.priceIn1M,
+      priceOut1M: entry.priceOut1M,
     };
   }
 

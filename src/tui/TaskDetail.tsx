@@ -1,6 +1,7 @@
 import React from 'react';
 import { Text, Box } from 'ink';
 import stringWidth from 'string-width';
+import { MAX_TASK_EVENTS } from './state';
 import type { TaskEntry } from './state';
 
 /**
@@ -37,7 +38,7 @@ export function TaskDetail({
     : '✗ 失败';
   const statusColor = task.ok === undefined ? 'yellow' : task.ok ? 'green' : 'red';
   const dur = task.durationMs ? `${(task.durationMs / 1000).toFixed(1)}s` : '...';
-  const toolCount = task.events.filter((e) => e.kind === 'tool-call').length;
+  const toolCount = task.toolCalls;
 
   const lines: React.ReactNode[] = [];
   let lineKey = 0;
@@ -67,6 +68,17 @@ export function TaskDetail({
       <Text dimColor>{'─'.repeat(Math.max(1, width))}</Text>
     </Box>
   );
+
+  // 事件被截断时的提示（工具计数仍是准确的，只是详情里看不到最早的记录）
+  if (task.truncatedEvents) {
+    pushLine(
+      <Box>
+        <Text color="yellowBright">
+          ⚠ 事件已截断：仅保留最近 {MAX_TASK_EVENTS} 条，丢弃 {task.truncatedEvents} 条早期记录
+        </Text>
+      </Box>
+    );
+  }
 
   // 时间线
   if (task.events.length === 0) {

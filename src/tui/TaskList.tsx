@@ -80,7 +80,7 @@ export function TaskList({
         const tag = t.kind === 'execute' ? 'E' : 'V';
         const statusIcon = t.ok === undefined ? '○' : t.ok ? '✓' : '✗';
         const dur = t.durationMs ? `${(t.durationMs / 1000).toFixed(1)}s` : '...';
-        const toolCount = t.events.filter((e) => e.kind === 'tool-call').length;
+        const toolCount = t.toolCalls;
 
         const marker = isSelected ? '▸' : ' ';
         const desc = truncate(t.description, Math.max(5, width - 26));

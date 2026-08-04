@@ -9,7 +9,7 @@
     "build": "tsc",
     "dev": "tsx src/index.tsx",
     "start": "node dist/index.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "tsc --noEmit && npx tsx scripts/smoke/run.ts"
   },
   "keywords": [
     "ai",
@@ -31,7 +31,7 @@
     "chalk": "^4.1.2",
     "glob": "^13.0.6",
     "ink": "^4.4.1",
-    "ink-text-input": "^6.0.0",
+    "ink-text-input": "^5.0.1",
     "jsonrepair": "^3.14.0",
     "ora": "^5.4.1",
     "react": "^18.3.1",

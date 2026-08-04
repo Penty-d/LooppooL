@@ -3,7 +3,12 @@
     "maxIterations": 20,
     "taskTimeout": 1800000,
     "globalParallelLimit": 10,
-    "validationThreshold": 80
+    "validationThreshold": 80,
+    "taskRetries": 1,
+    "approvalMode": "none",
+    "dangerousShell": "ask",
+    "budgetUSD": 0,
+    "contextSummarizer": ""
   },
   "logging": {
     "level": "info",
@@ -12,6 +17,7 @@
   },
   "storage": {
     "persistHistory": true,
-    "historyPath": "./data/history"
+    "historyPath": "./data/history",
+    "projectKey": ""
   }
 }
